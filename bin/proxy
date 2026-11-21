@@ -1,0 +1,331 @@
+#!/usr/bin/env python3
+"""proxy: stand in for the absent maintainer on escalations, so a blocked team
+can keep moving.
+
+Adapted from garden's proxy service: the script decides, without an LLM, which
+escalations are eligible, and spends one 'claude -p' (wearing roles/proxy.md)
+per eligible escalation. The script, not the model, carries out the decision.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import sbx_lib as lib
+from sbx_cli import CLI, Command
+
+BIN = Path(__file__).resolve().parent
+BUS_CMD = str(BIN / "bus")
+TOOLS = "Read,Grep,Glob,Bash(git log:*),Bash(git show:*),Bash(git diff:*),Bash(git status:*)"
+
+ANSWER_FORMAT = """
+# Your answer
+End with exactly these three parts, in this order:
+
+DECISION: handoff <tester|builder|reviewer>     (or)     DECISION: defer
+WHY: <one paragraph: the question, the options you weighed, the direction you chose and why;
+      for defer, why it's beyond proxy authority>
+MESSAGE:
+<for a handoff: the binding, specific instructions for the role you hand the turn to.
+ Name files, lines, tests, D-entries. Start with "Proxy decision (tentative):".>
+"""
+
+
+def note(message: str) -> None:
+    print(f"{lib.now()} proxy[{os.environ.get('SBX_TASK', '')}]: {message}", flush=True)
+
+
+def bus_as_proxy(*args: str, stdin: str | None = None) -> bool:
+    """Run 'bus <args>' as the proxy (stdout discarded); True on success."""
+    proc = subprocess.run(
+        [BUS_CMD, *args], input=stdin, text=True, stdout=subprocess.DEVNULL, env={**os.environ, "SBX_ROLE": "proxy"}
+    )
+    return proc.returncode == 0
+
+
+def tell_maintainer(kind: str, text: str) -> None:
+    if not bus_as_proxy("send", "maintainer", "-k", kind, text):
+        raise RuntimeError("bus send failed")
+
+
+# ---- the prompt -------------------------------------------------------------
+
+
+def digest(bus: Path) -> str:
+    """What the proxy reads: bus status, the maintainer's unread mail, the recent
+    log and commits, and DECISIONS.md if the worktree has one."""
+    status = subprocess.run([BUS_CMD, "status"], text=True, stdout=subprocess.PIPE).stdout
+    parts = ["## bus status\n", status, "\n## Messages waiting for the maintainer\n"]
+    for f in sorted((bus / "inbox" / "maintainer" / "unread").glob("*.md")):
+        parts += [f"### {f.stem}\n", f.read_text(), "\n"]
+    log = bus / "log"
+    tail = "".join(line + "\n" for line in lib.split_lines(log.read_text())[-30:]) if log.is_file() else ""
+    parts += ["\n## Recent bus log\n", tail]
+    parts += ["\n## Recent commits\n", lib.git("log", "--oneline", "-15", check=False) + "\n"]
+    decisions = Path("DECISIONS.md")
+    if decisions.is_file():
+        head = lib.split_lines(decisions.read_text())[:200]
+        parts += ["\n## DECISIONS.md\n", "".join(line + "\n" for line in head)]
+    return "".join(parts)
+
+
+def prompt_for(bus: Path) -> str:
+    brief = lib.SBX_ROOT / "roles" / "proxy.md"
+    parts = [brief.read_text() if brief.is_file() else ""]
+    prefs = lib.SBX_PROJECT / "proxy.md"
+    if prefs.is_file():
+        parts.append(f"\n## Project preferences (the maintainer's)\n\n{lib.read_text(prefs, '')}\n")
+    parts.append(
+        f"\n# The escalation\n\nTask: {os.environ.get('SBX_TASK', '')}. "
+        f"Worktree: {os.getcwd()} (read anything you need; change nothing).\n\n"
+    )
+    parts.append(digest(bus))
+    parts.append(ANSWER_FORMAT)
+    return "".join(parts).rstrip("\n")
+
+
+# ---- reading the answer -----------------------------------------------------
+
+
+def parse_answer(text: str):
+    """Pull DECISION, WHY and MESSAGE out of the model's answer."""
+    lines = lib.split_lines(text)
+    decision = next((re.sub(r"^DECISION:\s*", "", line) for line in lines if line.startswith("DECISION:")), "")
+    decision = re.sub(" +", " ", decision)
+
+    # WHY: every block from a 'WHY:' line through the next 'MESSAGE:' line, minus
+    # the 'WHY:' prefix and the last line (normally that 'MESSAGE:' line).
+    why_lines, inside = [], False
+    for line in lines:
+        if not inside:
+            if line.startswith("WHY:"):
+                why_lines.append(line)
+                inside = True
+        else:
+            why_lines.append(line)
+            if line.startswith("MESSAGE:"):
+                inside = False
+    if why_lines:
+        why_lines[0] = re.sub(r"^WHY:\s*", "", why_lines[0])
+        why_lines.pop()
+    why = "\n".join(why_lines).rstrip("\n")
+
+    # MESSAGE: everything after the first 'MESSAGE:' line.
+    start = next((i for i, line in enumerate(lines) if line.startswith("MESSAGE:")), None)
+    message = "\n".join(lines[start + 1 :]).rstrip("\n") if start is not None else ""
+    return decision, why, message
+
+
+# ---- one task ---------------------------------------------------------------
+
+
+def handle_task() -> None:
+    """Decide on this task's escalation, if it's eligible (run inside its worktree)."""
+    bus = lib.bus_dir()
+    if lib.conf_get("proxy", "off") != "on":
+        return
+    if lib.state_get("turn") != "maintainer":
+        return
+    reason = lib.state_get("turn_reason", "escalation")
+    if reason == "done":
+        return
+    at = lib.state_get("turn_at") or str(
+        int(os.stat(bus / "state" / "turn").st_mtime)
+    )  # state from before turn_at existed
+    grace = int(lib.conf_get("proxy_grace", "600"))
+    if int(time.time()) - int(at) < grace:
+        return
+    if lib.state_get("proxy_seen") == at:
+        return
+    count, budget = int(lib.state_get("proxy_count", "0")), lib.conf_get("proxy_max", "3")
+    if budget != "unlimited" and count >= int(budget):
+        # Noted once per escalation, but not marked seen: raising proxy_max later
+        # lets the proxy take up the escalation that is still waiting.
+        if lib.state_get("proxy_budget_noted") != at:
+            lib.state_set("proxy_budget_noted", at)
+            tell_maintainer(
+                "proxy-note",
+                f"Awaiting maintainer: the proxy has used its {count}/{budget} interventions "
+                "on this task (raise proxy_max to let it continue).",
+            )
+            note(f"budget used ({count}/{budget}); left for the maintainer")
+        return
+
+    note(f"deciding on a {reason} (waiting {int(time.time()) - int(at)}s)")
+    (bus / "tmp").mkdir(parents=True, exist_ok=True)
+    out = bus / "tmp" / f"proxy-{at}.md"
+    err = Path(f"{out}.err")
+    prompt = prompt_for(bus)
+    cmd = ["timeout", lib.conf_get("proxy_timeout", "900"), "claude", "-p", prompt, "--allowedTools", TOOLS]
+    if os.environ.get("PROXY_MODEL"):
+        cmd += ["--model", os.environ["PROXY_MODEL"]]
+    for _attempt in (1, 2):
+        with open(out, "w") as o, open(err, "w") as e:
+            subprocess.run(cmd, stdout=o, stderr=e)
+        if any(line.startswith("DECISION:") for line in lib.split_lines(out.read_text(errors="replace"))):
+            break
+    decision, why, message = parse_answer(out.read_text(errors="replace"))
+    lib.state_set("proxy_seen", at)
+
+    if decision in ("handoff tester", "handoff builder", "handoff reviewer"):
+        role = decision[len("handoff ") :]
+        message = message or f"Proxy decision (tentative): continue. Why: {why}"
+        if not bus_as_proxy("handoff", role, "-", stdin=message + "\n"):
+            tell_maintainer(
+                "proxy-note", f"The proxy chose to hand the turn to the {role}, but the bus refused. Output: {out}"
+            )
+            note(f"handoff to {role} refused by the bus")
+            return
+        lib.state_set("proxy_count", str(count + 1))
+        # The escalation is answered: archive it (and only it; reports, overrides
+        # and messages stay unread for the maintainer), and report the decision.
+        inbox = bus / "inbox" / "maintainer"
+        for f in sorted((inbox / "unread").glob("*.md")):
+            if "kind: escalation" in lib.split_lines(f.read_text()):
+                os.replace(f, inbox / "read" / f.name)
+        with open(bus / "proxy-decisions.md", "a") as log:
+            log.write(
+                f"\n## {lib.now()}: {reason} -> {role} ({count + 1}/{budget})\n\n"
+                f"**Why:** {why}\n\n**Instructions:**\n{message}\n"
+            )
+        host, task = socket.gethostname(), os.environ.get("SBX_TASK", "")
+        tell_maintainer(
+            "proxy-report",
+            f"""Proxy decided a {reason} for you (tentative). Turn -> {role}.
+
+To override, give the turn to the role that should act, with your instructions:
+  sbx bus {host} {task} handoff <tester|builder|reviewer> "<what to do instead>"
+To only add a note, without taking the turn:
+  sbx bus {host} {task} send {role} "<note>"
+
+Why: {why}
+
+Instructions sent:
+{message}
+
+Log: {bus}/proxy-decisions.md (the escalation itself is in your read inbox).""",
+        )
+        note(f"turn -> {role} ({count + 1}/{budget})")
+    elif decision == "defer":
+        tell_maintainer("proxy-note", f"Awaiting maintainer: beyond proxy authority. {why}")
+        note("deferred to the maintainer")
+    else:
+        tell_maintainer(
+            "proxy-note", f"The proxy couldn't reach a decision (no DECISION line). Output: {out}, errors: {err}"
+        )
+        note(f"no decision; see {out}")
+
+
+# ---- every task -------------------------------------------------------------
+
+
+def tick() -> None:
+    """One pass over every task of this clone (each in its own worktree)."""
+    common = subprocess.run(
+        ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], text=True, stdout=subprocess.PIPE
+    )
+    if common.returncode != 0:
+        lib.die("run me inside the clone")
+    common_dir = Path(common.stdout.rstrip("\n"))
+    repo = common_dir.parent
+    tasks = sorted(d for d in (common_dir / "sbx").glob("*") if d.is_dir()) if (common_dir / "sbx").is_dir() else []
+    home = os.getcwd()
+    for d in tasks:
+        task = d.name
+        worktree = repo if task == "main" else repo / ".worktrees" / task
+        if not worktree.is_dir():
+            continue
+        saved_task = os.environ.get("SBX_TASK")
+        try:
+            os.chdir(worktree)
+            os.environ["SBX_TASK"] = task
+            handle_task()
+        except (Exception, SystemExit):
+            print(f"{lib.now()} proxy[{task}]: tick failed", file=sys.stderr, flush=True)
+        finally:
+            os.chdir(home)
+            if saved_task is None:
+                os.environ.pop("SBX_TASK", None)
+            else:
+                os.environ["SBX_TASK"] = saved_task
+
+
+def cmd_tick(args: list[str]) -> int:
+    tick()
+    return 0
+
+
+def cmd_loop(args: list[str]) -> int:
+    seconds = args[0] if args and args[0] else "30"
+    top = lib.git("rev-parse", "--show-toplevel", check=False)
+    print(
+        f"{lib.now()} proxy: watching {top} every {seconds}s (acts only while the config says proxy = on)", flush=True
+    )
+    while True:
+        tick()
+        time.sleep(float(seconds))
+
+
+COMMANDS = [
+    Command(
+        "loop",
+        "[seconds]",
+        "check every task of this clone every <seconds> (default 30)",
+        """
+        Runs 'tick' forever. This is what 'sbx proxy <name>' (and 'sbx tdd', when the
+        config says proxy = on) starts in the fleet's 'proxy' tmux window; each
+        decision prints a timestamped line there.
+        """,
+        cmd_loop,
+    ),
+    Command(
+        "tick",
+        "",
+        "one pass over every task",
+        """
+        For every task of this clone (<clone>/.git/sbx/<task>), checks whether its
+        escalation is eligible and, if so, decides on it. A task whose check fails
+        prints "tick failed" and the others still run.
+        """,
+        cmd_tick,
+    ),
+]
+
+CLI(
+    "proxy",
+    """
+Stand in for the absent maintainer on escalations, so a blocked team can keep
+moving. The script decides, without an LLM, which escalations are eligible, and
+spends one 'claude -p' (wearing roles/proxy.md, plus the project's proxy.md) per
+eligible escalation. The script, not the model, carries out the decision.
+
+Inert unless the project config says 'proxy = on'; it rereads the config every
+tick, so turning it off takes effect on the next one. An escalation is eligible
+when:
+  - the maintainer holds the turn for an escalation or the round limit (never
+    for 'done': a finished task is the maintainer's to accept);
+  - it has waited proxy_grace seconds (default 600), so a present maintainer
+    gets the first say;
+  - the proxy hasn't already decided on it;
+  - the task has interventions left (proxy_max, default 3; 'unlimited' for no
+    cap). Past that the proxy leaves everything to the maintainer, with one note.
+
+The model answers 'DECISION: handoff <role>' (the turn goes to that role with
+binding, tentative instructions, through 'bus handoff' as the proxy) or
+'DECISION: defer' (a note to the maintainer; the turn stays with them). Every
+decision is logged to <bus>/proxy-decisions.md and reported to the maintainer's
+inbox, with the commands to override it.
+""",
+    COMMANDS,
+    footer=(
+        "Environment: PROXY_MODEL picks the model.\n"
+        "Config: proxy, proxy_grace, proxy_max, proxy_timeout (seconds, default 900)."
+    ),
+    default="overview-2",
+).run()

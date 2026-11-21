@@ -1,0 +1,57 @@
+# sbx project config. Lives at $SBX_HOME/<name>/project/config on the Mac and is
+# mounted read-only at /etc/sbx/project/config, so agents can't change their gates.
+# Format: "key = value", one per line; a key may repeat; '#' only at line start.
+# Edits take effect immediately (no restart).
+
+stack = solidity
+
+# Paths the tester owns. Ending in '/' = prefix, otherwise a glob ('*' crosses '/').
+test_paths = test/
+test_paths = *.t.sol
+
+# Paths no agent may change (the gate refuses any turn that touches them).
+protected = foundry.toml
+protected = remappings.txt
+protected = .github/
+protected = .claude/
+protected = CLAUDE.md
+
+# Paths the gate ignores: agents may leave them untracked (reports, notes).
+scratch = x-ray/
+
+# gate green: build, then the full suite, then every 'check'.
+build = forge build
+test = forge test
+check = forge fmt --check
+check = slither . --fail-on high
+
+# gate red / defensive / prover: run only the given test files.
+# {file} runs each file on its own (each must fail/pass); {files} runs them together.
+test_only = forge test --match-path {file}
+
+# Proxy: stands in for you on escalations (roles/proxy.md), deciding direction and
+# handing the turn on with binding instructions. Off unless 'on'; reread every tick.
+# proxy_grace: seconds an escalation waits for you first; proxy_max: decisions per task
+# ('unlimited' for no cap; the proxy still defers a question it has already decided).
+# Your standing preferences for it go in proxy.md next to this file.
+proxy = off
+proxy_grace = 600
+proxy_max = 3
+
+# Reviewer panel: seats from claude-sandbox/roles/jurors/, or 'none' for no reviewer.
+seats = prover saboteur breaker corner-prober
+# seat_model = claude-sonnet-5-5
+seat_timeout = 900
+max_rounds = 4
+
+# Specialization: skills (by directory name) each role is told to use. Install them
+# into this sandbox with: sbx skills <name> add <skill>...
+skills.tester = x-ray fizz
+skills.builder =
+skills.reviewer = solidity-auditor
+
+# Other stacks, for reference:
+#   TypeScript: test_paths = *.test.ts / build = npm run build / test = npm test
+#               check = npm run lint / test_only = npx vitest run {files}
+#   Python:     test_paths = tests/ / test = pytest / check = ruff check .
+#               test_only = pytest {files}

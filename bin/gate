@@ -1,0 +1,315 @@
+#!/usr/bin/env python3
+"""gate: deterministic acceptance checks for a turn.
+
+No LLM is involved; every command comes from the read-only project config
+($SBX_PROJECT/config). 'bus handoff' runs the checks for its transition;
+agents run them by hand to check their work early. Exit 0 = pass.
+"""
+
+from __future__ import annotations
+
+import shlex
+import subprocess
+from pathlib import Path
+
+import sbx_lib as lib
+from sbx_cli import CLI, Command
+
+
+def log_dir() -> Path:
+    path = lib.bus_dir() / "gate"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def turn_base() -> str:
+    """Default <base>: the commit where the current turn began (see 'bus status')."""
+    base = lib.state_get("turn_base")
+    if not base:
+        lib.die("no base given and the task isn't started (bus init)")
+    return base
+
+
+def indented_tail(log: Path, lines: int) -> None:
+    for line in lib.split_lines(log.read_text(errors="replace"))[-lines:]:
+        print(f"        {line}")
+
+
+def run_logged(cmd: str, log: Path) -> bool:
+    """Run a config command with bash, output to <log>; True on success."""
+    with open(log, "w") as out:
+        return subprocess.run(["bash", "-c", cmd], stdout=out, stderr=subprocess.STDOUT).returncode == 0
+
+
+def run_step(name: str, cmd: str) -> bool:
+    """Run a config command, log it, report ok/FAIL (with the log's tail on failure)."""
+    log = log_dir() / f"{lib.stamp()}-{name}.log"
+    if run_logged(cmd, log):
+        print(f"  ok    {name}: {cmd}")
+        return True
+    print(f"  FAIL  {name}: {cmd}  (log: {log})")
+    indented_tail(log, 20)
+    return False
+
+
+def test_files(base: str) -> list[str]:
+    """Test files added or modified since <base>."""
+    changed = lib.git("diff", "--name-only", "--no-renames", "--diff-filter=AM", base, "HEAD")
+    return [f for f in lib.split_lines(changed) if lib.is_test_path(f)]
+
+
+PRESENT = {"pass": "passes", "fail": "fails"}
+
+
+def check_one(expect: str, what: str, cmd: str) -> bool:
+    """Run one test command; it must 'pass' or 'fail' as <expect>ed."""
+    log = log_dir() / f"{lib.stamp()}-test.log"
+    got = "pass" if run_logged(cmd, log) else "fail"
+    if got == expect:
+        print(f"  ok    {what}: {PRESENT[got]} as required")
+        if expect == "fail":
+            # A red run's reason matters (a typo also fails); show it to the next turn.
+            indented_tail(log, 8)
+        return True
+    print(f"  FAIL  {what}: expected to {expect}, but it {got}ed  (log: {log})")
+    indented_tail(log, 20)
+    return False
+
+
+def run_tests(expect: str, files: list[str]) -> bool:
+    """Run the config's 'test_only' on <files>.
+
+    With {file} in the template every file runs (and must meet <expect>) on its
+    own; with {files} they run once, together.
+    """
+    template = lib.conf_get("test_only")
+    if not template:
+        lib.die(f"no 'test_only' in {lib.SBX_PROJECT}/config")
+    ok = True
+    if "{file}" in template:
+        for f in files:
+            ok = check_one(expect, f, template.replace("{file}", shlex.quote(f))) and ok
+    elif "{files}" in template:
+        quoted = "".join(shlex.quote(f) + " " for f in files)
+        ok = check_one(expect, " ".join(files), template.replace("{files}", quoted))
+    else:
+        lib.die("'test_only' must contain {file} or {files}")
+    return ok
+
+
+# ---- commands ---------------------------------------------------------------
+
+
+def cmd_clean(args: list[str]) -> int:
+    dirty = lib.changed_paths()
+    if dirty:
+        print("  FAIL  uncommitted changes (commit or remove them first):")
+        for path in dirty:
+            print(f"        {path}")
+        return 1
+    print("  ok    working tree clean")
+    return 0
+
+
+def cmd_paths(args: list[str]) -> int:
+    if not args or not args[0]:
+        lib.die("usage: gate paths <role> [base]")
+    role = args[0]
+    base = args[1] if len(args) > 1 and args[1] else turn_base()
+    bad = False
+    for f in lib.changed_paths(base):
+        if lib.is_protected(f):
+            print(f"  FAIL  {f} is protected (only the maintainer changes it)")
+            bad = True
+            continue
+        if role == "tester":
+            if not lib.is_test_path(f):
+                print(f"  FAIL  {f} is production code; the tester edits tests only")
+                bad = True
+        elif role == "builder":
+            if lib.is_test_path(f):
+                print(f"  FAIL  {f} is a test; the builder doesn't edit tests (ask the tester)")
+                bad = True
+        elif role == "reviewer":
+            print(f"  FAIL  {f} changed; the reviewer doesn't edit the tree")
+            bad = True
+        elif role == "maintainer":
+            pass
+        else:
+            lib.die(f"unknown role '{role}'")
+    if not bad:
+        print(f"  ok    {role} touched only its own paths since {base[:10]}")
+    return 1 if bad else 0
+
+
+def _new_tests_must(expect: str, args: list[str]) -> int:
+    base = args[0] if args and args[0] else turn_base()
+    files = test_files(base)
+    if not files:
+        print(f"  FAIL  no test files added or changed since {base[:10]}")
+        return 1
+    return 0 if run_tests(expect, files) else 1
+
+
+def cmd_red(args: list[str]) -> int:
+    return _new_tests_must("fail", args)
+
+
+def cmd_defensive(args: list[str]) -> int:
+    return _new_tests_must("pass", args)
+
+
+def cmd_green(args: list[str]) -> int:
+    build, test = lib.conf_get("build"), lib.conf_get("test")
+    if not test:
+        lib.die(f"no 'test' in {lib.SBX_PROJECT}/config")
+    ok = True
+    if build:
+        ok = run_step("build", build) and ok
+    ok = run_step("test", test) and ok
+    for check in lib.conf_all("check"):
+        if check:
+            ok = run_step("check", check) and ok
+    return 0 if ok else 1
+
+
+def cmd_prover(args: list[str]) -> int:
+    """Revert the production files changed since <base> IN PLACE, run the tests,
+    then restore HEAD. In place (not a scratch worktree) so submodules, lib/ and
+    build caches are exactly what the real run sees. Requires a clean tree, so
+    restoring is just 'reset --hard'."""
+    if not args or not args[0]:
+        lib.die("usage: gate prover <base> <file>...")
+    base, files = args[0], args[1:]
+    if not files:
+        print("  ok    prover: no red tests this cycle (defensive only), skipped")
+        return 0
+    if lib.changed_paths():
+        lib.die("prover needs a clean tree")
+    production = []
+    for line in lib.split_lines(lib.git("diff", "--name-status", "--no-renames", base, "HEAD")):
+        status, _, path = line.partition("\t")
+        if not lib.is_test_path(path):
+            production.append((status, path))
+    if not production:
+        print(f"  FAIL  prover: no production change since {base[:10]}, so nothing made the tests pass")
+        return 1
+
+    try:
+        for status, path in production:
+            if status == "A":
+                Path(path).unlink(missing_ok=True)
+            else:
+                lib.git("checkout", "-q", base, "--", path)
+        print(f"  ..    prover: reverted {len(production)} production file(s) to {base[:10]}")
+        ok = run_tests("fail", files)
+    finally:
+        subprocess.run(["git", "reset", "-q", "--hard", "HEAD"])
+    print("  ..    prover: restored HEAD")
+    return 0 if ok else 1
+
+
+COMMANDS = [
+    Command(
+        "clean",
+        "",
+        "every change is committed (no dirty or untracked files)",
+        """
+        Fails, listing the paths, if anything in the worktree is modified, staged or
+        untracked. Paths matching the config's 'scratch' patterns (agent notes,
+        reports) are ignored. Every handoff gate starts with this check, because the
+        next role must see exactly what was committed.
+        """,
+        cmd_clean,
+    ),
+    Command(
+        "paths",
+        "<role> [base]",
+        "the role touched only what it owns since <base>",
+        """
+        Looks at every path committed since <base>, plus anything dirty or untracked,
+        and checks it against the role's ownership:
+
+          tester      may change test paths only (config 'test_paths')
+          builder     may change anything except test paths
+          reviewer    may change nothing at all
+          maintainer  may change anything
+
+        A path matching the config's 'protected' patterns fails for every role but the
+        maintainer. Prints one FAIL line per offending path.
+
+        <base> defaults to the commit where the current turn began.
+        """,
+        cmd_paths,
+    ),
+    Command(
+        "red",
+        "[base]",
+        "each test file added/changed since <base> FAILS",
+        """
+        Runs the config's 'test_only' command on the test files added or modified
+        since <base>; each must fail. This is the tester's proof that the new tests
+        demand something the code doesn't do yet. The tail of each failing run is
+        printed, so the builder can see the failure is for the right reason (a typo
+        fails too). Fails outright if no test file changed.
+
+        <base> defaults to the commit where the current turn began.
+        """,
+        cmd_red,
+    ),
+    Command(
+        "defensive",
+        "[base]",
+        "each test file added/changed since <base> PASSES",
+        """
+        The opposite of 'red', for defensive coverage: tests that pin behavior the code
+        already has. Each test file added or modified since <base> must pass. Used by
+        'bus handoff builder --defensive "<why>"'.
+
+        <base> defaults to the commit where the current turn began.
+        """,
+        cmd_defensive,
+    ),
+    Command(
+        "green",
+        "",
+        "build, full test suite and every 'check' pass",
+        """
+        Runs, from the config, 'build' (if set), then 'test' (required), then every
+        'check' line, each logged separately. All of them run even after a failure,
+        so you see every problem at once. A failure prints the last 20 lines of its log.
+        """,
+        cmd_green,
+    ),
+    Command(
+        "prover",
+        "<base> <file>...",
+        "with production changes since <base> reverted, the listed test files FAIL again",
+        """
+        Regression evidence: proves the builder's change is what makes the tests pass.
+        Needs a clean tree. It reverts every non-test file changed since <base> in
+        place (files added since <base> are deleted), runs each listed test file
+        (each must fail), then restores HEAD with 'git reset --hard HEAD', even if
+        something goes wrong.
+
+        With no files (a cycle of defensive tests only) it passes and skips. With no
+        production change since <base> it fails: nothing made the tests pass.
+        """,
+        cmd_prover,
+    ),
+]
+
+CLI(
+    "gate",
+    """
+Deterministic acceptance checks for a turn. No LLM is involved; every command
+comes from the read-only project config ($SBX_PROJECT/config). 'bus handoff' runs
+the checks its transition needs; run them yourself to check your work early.
+""",
+    COMMANDS,
+    footer="""
+<base> defaults to the commit where the current turn began (bus status).
+Exit 0 = pass. Logs go to <bus>/gate/; the tail is printed on failure.
+""",
+    default="overview-2",
+).run()

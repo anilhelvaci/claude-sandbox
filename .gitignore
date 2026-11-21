@@ -1,0 +1,7 @@
+# stray local notes, not part of the tool
+glow
+
+__pycache__/
+.ruff_cache/
+.venv/
+.DS_Store

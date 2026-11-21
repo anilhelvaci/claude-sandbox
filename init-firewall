@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""Outbound allowlist for a sandbox container.
+
+Adapted from anthropics/claude-code/.devcontainer/init-firewall.sh.
+
+Runs as root (sbx does it on container start; the ubuntu user may run it via
+sudo, with no arguments, and nothing else). Safe to rerun to refresh IPs: the
+new address set is built first and swapped in atomically, and if anything fails
+before that, the rules already in place stay untouched.
+
+What it allows: loopback, DNS, replies to established connections, GitHub's
+published IPv4 ranges, and the IPv4 addresses of every domain in
+/etc/sbx/allowlist/*.txt and /etc/sbx/allowlist.local/*.txt. Everything else
+outbound is rejected, including the host (host.docker.internal). No IPv6 egress.
+"""
+
+from __future__ import annotations
+
+import glob
+import json
+import re
+import subprocess
+import sys
+from typing import NoReturn
+
+SET = "allowed-domains"
+TMP = "allowed-domains-new"
+LISTS = sorted(glob.glob("/etc/sbx/allowlist/*.txt")) + sorted(glob.glob("/etc/sbx/allowlist.local/*.txt"))
+IPV4 = re.compile(r"^[0-9]{1,3}(\.[0-9]{1,3}){3}$")
+IPV4_CIDR = re.compile(r"^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$")
+
+
+def run(*cmd: str, stdin: str | None = None) -> str:
+    """Run a command; stop the script with its exit code if it fails."""
+    proc = subprocess.run(cmd, input=stdin, text=True, stdout=subprocess.PIPE)
+    if proc.returncode != 0:
+        sys.exit(proc.returncode)
+    return proc.stdout
+
+
+def succeeds(*cmd: str) -> bool:
+    return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+
+def fail(message: str) -> NoReturn:
+    print(f"ERROR: {message}", flush=True)
+    sys.exit(1)
+
+
+def github_ranges() -> list[str]:
+    """GitHub publishes its ranges; resolving github.com alone isn't enough."""
+    print("Fetching GitHub IP ranges...", flush=True)
+    meta = subprocess.run(
+        ["curl", "-fsS", "--connect-timeout", "10", "https://api.github.com/meta"], text=True, stdout=subprocess.PIPE
+    )
+    if meta.returncode != 0:
+        fail("failed to fetch GitHub IP ranges")
+    try:
+        data = json.loads(meta.stdout)
+        if not all(data.get(k) not in (None, False) for k in ("web", "api", "git")):
+            raise ValueError
+    except (ValueError, AttributeError):
+        fail("GitHub meta response missing required fields")
+    ipv4 = [c for c in data["web"] + data["api"] + data["git"] if ":" not in c]
+    aggregated = subprocess.run(
+        ["aggregate", "-q"], input="".join(c + "\n" for c in ipv4), text=True, stdout=subprocess.PIPE
+    ).stdout.split("\n")
+    return [c for c in aggregated if c]
+
+
+def allowlisted_domains() -> list[str]:
+    """One domain per line; '#' starts a comment; blanks ignored."""
+    domains = set()
+    for path in LISTS:
+        with open(path) as f:
+            for line in f:
+                domain = re.sub(r"[ \t\r]", "", line.split("#", 1)[0].rstrip("\n"))
+                if domain:
+                    domains.add(domain)
+    return sorted(domains)
+
+
+def build_address_set() -> None:
+    subprocess.run(["ipset", "destroy", TMP], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    run("ipset", "create", TMP, "hash:net")
+
+    for cidr in github_ranges():
+        if not IPV4_CIDR.match(cidr):
+            fail(f"invalid CIDR from GitHub meta: {cidr}")
+        run("ipset", "add", "-exist", TMP, cidr)
+
+    for domain in allowlisted_domains():
+        answer = subprocess.run(["dig", "+short", "A", domain], text=True, stdout=subprocess.PIPE).stdout
+        ips = [ip for ip in answer.split("\n") if IPV4.match(ip)]
+        if not ips:
+            print(f"WARNING: could not resolve {domain}, skipping", flush=True)
+            continue
+        for ip in ips:
+            run("ipset", "add", "-exist", TMP, ip)
+        print(f"Allowed {domain} ({''.join(ip + ' ' for ip in ips)})", flush=True)
+
+    # Swap the new set in atomically.
+    run("ipset", "create", "-exist", SET, "hash:net")
+    run("ipset", "swap", TMP, SET)
+    run("ipset", "destroy", TMP)
+
+
+def install_rules() -> None:
+    """The rules themselves never change, so only build them once. Inbound is
+    left alone so published dev-server ports keep working (replies are
+    ESTABLISHED). The host network (host.docker.internal) is deliberately NOT allowed."""
+    if not succeeds("iptables", "-C", "OUTPUT", "-j", "SBX_OUT"):
+        if not succeeds("iptables", "-N", "SBX_OUT"):
+            run("iptables", "-F", "SBX_OUT")
+        run("iptables", "-A", "SBX_OUT", "-o", "lo", "-j", "ACCEPT")
+        run("iptables", "-A", "SBX_OUT", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT")
+        run("iptables", "-A", "SBX_OUT", "-p", "udp", "--dport", "53", "-j", "ACCEPT")
+        run("iptables", "-A", "SBX_OUT", "-p", "tcp", "--dport", "53", "-j", "ACCEPT")
+        run("iptables", "-A", "SBX_OUT", "-m", "set", "--match-set", SET, "dst", "-j", "ACCEPT")
+        run("iptables", "-A", "SBX_OUT", "-j", "REJECT", "--reject-with", "icmp-admin-prohibited")
+        run("iptables", "-I", "OUTPUT", "1", "-j", "SBX_OUT")
+
+    # No IPv6 egress at all (the allowlist is IPv4 only).
+    if succeeds("ip6tables", "-S", "OUTPUT"):
+        if not succeeds("ip6tables", "-C", "OUTPUT", "-o", "lo", "-j", "ACCEPT"):
+            run("ip6tables", "-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT")
+        if not succeeds("ip6tables", "-C", "OUTPUT", "-j", "REJECT"):
+            run("ip6tables", "-A", "OUTPUT", "-j", "REJECT")
+        run("ip6tables", "-P", "OUTPUT", "DROP")
+
+
+def verify() -> None:
+    print("Verifying firewall...", flush=True)
+    if succeeds("curl", "-s", "--connect-timeout", "5", "https://example.com"):
+        fail("firewall verification failed: https://example.com is reachable")
+    for url in ("https://api.github.com/zen", "https://api.anthropic.com"):
+        if not succeeds("curl", "-s", "--connect-timeout", "5", "-o", "/dev/null", url):
+            fail(f"firewall verification failed: {url} is unreachable")
+    print("Firewall up: example.com blocked; GitHub and Anthropic reachable", flush=True)
+
+
+if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
+    print((__doc__ or "").strip())
+    sys.exit(0)
+build_address_set()
+install_rules()
+verify()

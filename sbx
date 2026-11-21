@@ -1,0 +1,983 @@
+#!/usr/bin/env python3
+"""sbx: run fleets of Claude Code agents in a sandboxed Ubuntu container, each
+sandbox working on its own dedicated clone of a project.
+
+Runs on the host (your Mac). Everything that happens inside a container goes
+through 'docker exec'; the scripts the agents use (bus, gate, panel, proxy,
+role-prompt) live in bin/ and are mounted into every container read-only.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import NoReturn
+
+HERE = Path(os.path.abspath(os.path.dirname(__file__)))
+sys.dont_write_bytecode = True  # keep bin/ free of __pycache__ (it's mounted into every container)
+sys.path.insert(0, str(HERE / "bin"))
+from sbx_cli import CLI, Command  # noqa: E402
+
+SBX_HOME = Path(os.environ.get("SBX_HOME") or os.path.expanduser("~/sandboxes"))
+SBX_IMAGE = os.environ.get("SBX_IMAGE") or "claude-sandbox:latest"
+SBX_PORTS = (
+    os.environ.get("SBX_PORTS") or "3000 5173 8000 8545"
+)  # container ports published on 127.0.0.1 (random host ports)
+SBX_CONFIG_VOLUME = (
+    os.environ.get("SBX_CONFIG_VOLUME") or "claude-sandbox-config"
+)  # shared Claude login across sandboxes
+SBX_SKILLS_SRC = Path(
+    os.environ.get("SBX_SKILLS_SRC") or os.path.expanduser("~/.claude/skills")
+)  # where 'sbx skills add' copies from
+FIREWALL_SCRIPT = "/usr/local/bin/init-firewall"
+ROLES = ("tester", "builder", "reviewer")
+
+
+# ---- small helpers ----------------------------------------------------------
+
+
+def die(message: str) -> NoReturn:
+    print(f"sbx: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def warn(message: str) -> None:
+    print(f"sbx: {message}", file=sys.stderr)
+
+
+def cname(name: str) -> str:
+    return f"sbx-{name}"
+
+
+def sandbox_dir(name: str) -> Path:
+    return SBX_HOME / name
+
+
+def repo_dir(name: str) -> Path:
+    return SBX_HOME / name / "repo"
+
+
+def project_dir(name: str) -> Path:
+    return SBX_HOME / name / "project"
+
+
+def run(*cmd: str, quiet: bool = False) -> None:
+    """Run a command; stop sbx with its exit code if it fails."""
+    rc = subprocess.run(cmd, stdout=subprocess.DEVNULL if quiet else None).returncode
+    if rc != 0:
+        sys.exit(rc)
+
+
+def output(*cmd: str, check: bool = True) -> str:
+    """A command's stdout (trailing newlines removed); stop sbx if it fails and check is set."""
+    proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE)
+    if check and proc.returncode != 0:
+        sys.exit(proc.returncode)
+    return proc.stdout.rstrip("\n")
+
+
+def succeeds(*cmd: str) -> bool:
+    return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+
+def exec_interactive(*cmd: str) -> None:
+    """Replace sbx with an interactive command (a shell, tmux, claude)."""
+    sys.stdout.flush()
+    os.execvp(cmd[0], list(cmd))
+
+
+def need_name(args: list[str]) -> str:
+    if not args or not args[0]:
+        die("missing <name>; see 'sbx help'")
+    return args[0]
+
+
+def firewall_on(name: str) -> bool:
+    try:
+        setting = (sandbox_dir(name) / "firewall").read_text().rstrip("\n")
+    except OSError:
+        setting = "1"
+    return setting == "1"
+
+
+def cfg_get(name: str, key: str, default: str = "") -> str:
+    """Read a key from the sandbox's project config (host side)."""
+    try:
+        lines = (project_dir(name) / "config").read_text().split("\n")
+    except OSError:
+        lines = []
+    prefix = re.compile(r"^\s*" + re.escape(key) + r"\s*=\s*")
+    for line in lines:
+        m = prefix.match(line)
+        if m:
+            return line[m.end() :] or default
+    return default
+
+
+# ---- containers -------------------------------------------------------------
+
+
+def ensure_running(name: str) -> None:
+    """Make sure the sandbox's container exists, runs, is firewalled and has its tmux session."""
+    c = cname(name)
+    if not repo_dir(name).is_dir():
+        die(f"no sandbox '{name}' (expected {repo_dir(name)})")
+    if not succeeds("docker", "container", "inspect", c):
+        start_container(name)
+    elif output("docker", "inspect", "-f", "{{.State.Running}}", c, check=False) != "true":
+        run("docker", "start", c, quiet=True)
+    # Rules live in the container's network namespace and vanish on restart, so
+    # (re)apply them before anything else runs. Fail closed: no firewall, no sandbox.
+    if firewall_on(name):
+        sets = subprocess.run(
+            ["docker", "exec", "-u", "root", c, "ipset", "list", "-n"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        ).stdout
+        if "allowed-domains" not in sets.split("\n"):
+            if not apply_firewall(name):
+                run("docker", "stop", c, quiet=True)
+                die("firewall failed; container stopped")
+    if subprocess.run(["docker", "exec", c, "test", "-x", "/opt/sbx/bin/bus"]).returncode != 0:
+        warn(f"'{name}' predates roles/bus/gate; recreate it to get them: sbx rm {name} (the clone is kept)")
+    # One tmux session per sandbox; each agent is a window in it.
+    if (
+        subprocess.run(
+            ["docker", "exec", c, "tmux", "has-session", "-t", "fleet"], stderr=subprocess.DEVNULL
+        ).returncode
+        != 0
+    ):
+        run("docker", "exec", "-w", str(repo_dir(name)), c, "tmux", "new-session", "-d", "-s", "fleet", "-n", "shell")
+
+
+def apply_firewall(name: str) -> bool:
+    return subprocess.run(["docker", "exec", "-u", "root", cname(name), FIREWALL_SCRIPT]).returncode == 0
+
+
+def start_container(name: str) -> None:
+    repo, project = repo_dir(name), project_dir(name)
+    args: list[str] = []
+    for port in SBX_PORTS.split():
+        args += ["-p", f"127.0.0.1::{port}"]
+    if firewall_on(name):
+        args += ["--cap-add", "NET_ADMIN", "--cap-add", "NET_RAW"]
+    (sandbox_dir(name) / "allowlist").mkdir(parents=True, exist_ok=True)
+    (project / "skills").mkdir(parents=True, exist_ok=True)
+    if not (project / "config").exists():
+        for template in sorted((HERE / "templates" / "project").iterdir()):
+            if not (project / template.name).exists():
+                shutil.copy(template, project / template.name)
+    # Roles, skills and the bus/gate scripts come from this directory; the
+    # project's gate config, role notes and stack skills from project/. All
+    # read-only, so agents can't rewrite their own rules. project/skills is
+    # mounted over ~/.claude/skills: each sandbox sees only the skills it was given.
+    # The repo is mounted at the SAME absolute path as on the host so git
+    # worktree metadata (absolute paths) is valid from both sides.
+    # .git/config and .git/hooks are read-only inside: they're what git and
+    # editors on the Mac execute from (hooks, core.fsmonitor, core.hooksPath...).
+    mounts = [
+        f"{repo}:{repo}",
+        f"{repo}/.git/config:{repo}/.git/config:ro",
+        f"{repo}/.git/hooks:{repo}/.git/hooks:ro",
+        f"{HERE}/allowlist:/etc/sbx/allowlist:ro",
+        f"{sandbox_dir(name)}/allowlist:/etc/sbx/allowlist.local:ro",
+        f"{SBX_CONFIG_VOLUME}:/home/ubuntu/.claude",
+        f"{HERE}/bin:/opt/sbx/bin:ro",
+        f"{HERE}/roles:/opt/sbx/roles:ro",
+        f"{HERE}/skills:/opt/sbx/skills:ro",
+        f"{project}:/etc/sbx/project:ro",
+        f"{project}/skills:/home/ubuntu/.claude/skills:ro",
+        f"sbx-{name}-cache:/home/ubuntu/.cache",
+    ]
+    cmd = ["docker", "run", "-d", "--name", cname(name), "--hostname", name]
+    for mount in mounts:
+        cmd += ["-v", mount]
+    cmd += ["--memory", os.environ.get("SBX_MEMORY") or "8g", "--cpus", os.environ.get("SBX_CPUS") or "6"]
+    run(*cmd, *args, SBX_IMAGE, quiet=True)
+
+
+def worktree(name: str, task: str) -> Path:
+    """Create .worktrees/<task> on branch agent/<task> if needed; return its path.
+
+    Created from the host: .git/config is read-only inside the container.
+    """
+    repo = repo_dir(name)
+    path = repo / ".worktrees" / task
+    if not path.is_dir():
+        git = ["git", "-C", str(repo), "worktree", "add"]
+        if succeeds("git", "-C", str(repo), "show-ref", "--verify", "--quiet", f"refs/heads/agent/{task}"):
+            cmd = [*git, str(path), f"agent/{task}"]
+        else:
+            cmd = [*git, "-b", f"agent/{task}", str(path)]
+        rc = subprocess.run(cmd, stdout=sys.stderr).returncode
+        if rc != 0:
+            sys.exit(rc)
+    return path
+
+
+# ---- commands ---------------------------------------------------------------
+
+
+def cmd_build(args: list[str]) -> int:
+    return subprocess.run(["docker", "build", "-t", SBX_IMAGE, *args, str(HERE)]).returncode
+
+
+def cmd_new(args: list[str]) -> int:
+    name = need_name(args)
+    src = args[1] if len(args) > 1 else ""
+    branch = args[2] if len(args) > 2 else ""
+    if not src:
+        die("usage: sbx new <name> <git-url-or-local-path> [branch]")
+    repo = repo_dir(name)
+    if repo.exists():
+        die(f"{repo} already exists")
+    sandbox_dir(name).mkdir(parents=True, exist_ok=True)
+    run("git", "clone", *(["--branch", branch] if branch else []), src, str(repo))
+    if os.path.isdir(src):
+        # Point origin at the real upstream (fetch only: no credentials in the
+        # container), keep the local source as 'host' for host-side convenience.
+        upstream = subprocess.run(
+            ["git", "-C", src, "remote", "get-url", "origin"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        ).stdout.rstrip("\n")
+        run("git", "-C", str(repo), "remote", "rename", "origin", "host")
+        if upstream:
+            run("git", "-C", str(repo), "remote", "add", "origin", upstream)
+    with open(repo / ".git" / "info" / "exclude", "a") as exclude:
+        exclude.write(".worktrees/\n")
+    (sandbox_dir(name) / "firewall").write_text((os.environ.get("SBX_FIREWALL") or "1") + "\n")
+    if not succeeds("docker", "image", "inspect", SBX_IMAGE):
+        rc = cmd_build([])
+        if rc != 0:
+            return rc
+    ensure_running(name)
+    print(f"sandbox '{name}' ready: {repo} (firewall {'on' if firewall_on(name) else 'OFF'})")
+    print(f"  sbx login {name}          log Claude in (once for all sandboxes)")
+    print(f"  sbx agent {name} <task>   start an agent in its own worktree")
+    print(f"  sbx attach {name}         watch the fleet (tmux)")
+    return 0
+
+
+def cmd_agent(args: list[str]) -> int:
+    name = need_name(args)
+    task = args[1] if len(args) > 1 else ""
+    rest = args[2:]
+    role = ""
+    if rest and rest[0] == "--role":
+        if len(rest) < 2 or not rest[1]:
+            die("--role needs tester, builder or reviewer")
+        role, rest = rest[1], rest[2:]
+    ensure_running(name)
+    c = cname(name)
+    if not task:
+        if role:
+            die("--role needs a task (the team shares its worktree)")
+        path, task = repo_dir(name), "main"
+    else:
+        path = worktree(name, task)
+    # The remaining arguments go to claude, quoted for the shell tmux starts.
+    claude_args = "".join(shlex.quote(a) + " " for a in rest) if rest else "'' "
+    window, env, system_prompt = task, [], ""
+    if role:
+        if role not in ROLES:
+            die(f"unknown role '{role}' (tester, builder, reviewer)")
+        window = f"{task}-{role}"
+        env = ["-e", f"SBX_TASK={task}", "-e", f"SBX_ROLE={role}"]
+        run("docker", "exec", "-w", str(path), "-e", f"SBX_TASK={task}", c, "/opt/sbx/bin/bus", "init", quiet=True)
+        system_prompt = f'--append-system-prompt "$(/opt/sbx/bin/role-prompt {role})" '
+    run(
+        "docker",
+        "exec",
+        c,
+        "tmux",
+        "new-window",
+        "-t",
+        "fleet",
+        "-n",
+        window,
+        "-c",
+        str(path),
+        *env,
+        f"claude --dangerously-skip-permissions {system_prompt}{claude_args}; exec bash",
+    )
+    branch = output("git", "-C", str(path), "branch", "--show-current", check=False)
+    print(f"agent '{window}' started in {path} (branch {branch}); 'sbx attach {name}' to watch")
+    return 0
+
+
+def cmd_tdd(args: list[str]) -> int:
+    name = need_name(args)
+    task = args[1] if len(args) > 1 else ""
+    spec = args[2] if len(args) > 2 else ""
+    if not task or not spec:
+        die('usage: sbx tdd <name> <task> "<spec, or a path to it in the repo>"')
+    idle = (
+        f"You are on an sbx team for task '{task}'. Run 'bus status' and 'bus read'; "
+        "if it's not your turn, wait for a handoff as COMMON describes."
+    )
+    cmd_agent([name, task, "--role", "builder", idle])
+    if cfg_get(name, "seats", "x") != "none":
+        cmd_agent([name, task, "--role", "reviewer", idle])
+    cmd_agent([name, task, "--role", "tester", f"You hold the first turn on task '{task}'. The spec: {spec}"])
+    if cfg_get(name, "proxy", "off") == "on":
+        cmd_proxy([name])
+    return 0
+
+
+def cmd_proxy(args: list[str]) -> int:
+    name = need_name(args)
+    ensure_running(name)
+    c = cname(name)
+    windows = subprocess.run(
+        ["docker", "exec", c, "tmux", "list-windows", "-t", "fleet", "-F", "#W"], text=True, stdout=subprocess.PIPE
+    )
+    if windows.returncode == 0 and "proxy" in windows.stdout.split("\n"):
+        print(f"proxy already running in '{name}' (window 'proxy')")
+        return 0
+    run(
+        "docker",
+        "exec",
+        c,
+        "tmux",
+        "new-window",
+        "-d",
+        "-t",
+        "fleet",
+        "-n",
+        "proxy",
+        "-c",
+        str(repo_dir(name)),
+        "/opt/sbx/bin/proxy loop; exec bash",
+    )
+    setting, grace = cfg_get(name, "proxy", "off"), cfg_get(name, "proxy_grace", "600")
+    print(f"proxy started in '{name}' ({setting} in the config; grace {grace}s)")
+    return 0
+
+
+def cmd_bus(args: list[str]) -> int:
+    name = need_name(args)
+    task = args[1] if len(args) > 1 else ""
+    if not task:
+        die("usage: sbx bus <name> <task> <bus args>")
+    ensure_running(name)
+    path = repo_dir(name) / ".worktrees" / task
+    if not path.is_dir():
+        die(f"no task '{task}' (no {path})")
+    sys.stdout.flush()
+    return subprocess.run(
+        [
+            "docker",
+            "exec",
+            "-i",
+            "-w",
+            str(path),
+            "-e",
+            f"SBX_TASK={task}",
+            "-e",
+            "SBX_ROLE=maintainer",
+            cname(name),
+            "/opt/sbx/bin/bus",
+            *args[2:],
+        ]
+    ).returncode
+
+
+def cmd_inbox(args: list[str]) -> int:
+    name = need_name(args)
+    any_unread = False
+    bus_root = repo_dir(name) / ".git" / "sbx"
+    tasks = sorted(d for d in bus_root.iterdir() if d.is_dir()) if bus_root.is_dir() else []
+    for d in tasks:
+        if any((d / "inbox" / "maintainer" / "unread").glob("*.md")):
+            any_unread = True
+            print(f"##### task {d.name}", flush=True)
+            rc = cmd_bus([name, d.name, "read"])
+            if rc != 0:
+                return rc
+    if not any_unread:
+        print("(no unread messages)")
+    return 0
+
+
+def cmd_merge(args: list[str]) -> int:
+    """Bring a finished task's work into the repo the sandbox was cloned from.
+
+    Runs on the host; the container has no access to that repo. It never
+    touches that repo's working tree or index, so uncommitted work there
+    doesn't matter: it creates the branch, fast-forwards it, or builds a merge
+    commit without a checkout. It won't move a branch that is checked out there
+    (that would desync the working tree).
+    """
+    name = need_name(args)
+    task = args[1] if len(args) > 1 else ""
+    if not task:
+        die("usage: sbx merge <name> <task> [--branch <b>] [--yes] [--force]")
+    target, yes, force = "", False, False
+    rest = args[2:]
+    while rest:
+        if rest[0] == "--branch":
+            if len(rest) < 2 or not rest[1]:
+                die("--branch needs a name")
+            target, rest = rest[1], rest[2:]
+        elif rest[0] in ("--yes", "-y"):
+            yes, rest = True, rest[1:]
+        elif rest[0] == "--force":
+            force, rest = True, rest[1:]
+        else:
+            die(f"unknown option '{rest[0]}'")
+    target = target or task
+
+    repo = repo_dir(name)
+    wt, br = repo / ".worktrees" / task, f"agent/{task}"
+    if not repo.is_dir():
+        die(f"no sandbox '{name}' ({repo})")
+    if not succeeds("git", "-C", str(repo), "show-ref", "--verify", "--quiet", f"refs/heads/{br}"):
+        die(f"no branch {br} in {repo}")
+    up_proc = subprocess.run(
+        ["git", "-C", str(repo), "remote", "get-url", "host"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    if up_proc.returncode != 0:
+        die("the clone has no 'host' remote (it wasn't cloned from a local repo), so there's no upstream to merge into")
+    up = up_proc.stdout.rstrip("\n")
+    if not succeeds("git", "-C", up, "rev-parse", "--git-dir"):
+        die(f"upstream '{up}' isn't a git repo")
+    if not succeeds("git", "check-ref-format", "--branch", target):
+        die(f"'{target}' isn't a valid branch name")
+
+    def ug(*git_args: str, check: bool = True) -> str:
+        """git in the upstream repo."""
+        return output("git", "-C", up, *git_args, check=check)
+
+    # Finished means the team handed the turn back as done (bus done, or a passed chore).
+    state = repo / ".git" / "sbx" / task / "state"
+
+    def read_state(key: str) -> str:
+        try:
+            return (state / key).read_text().rstrip("\n")
+        except OSError:
+            return "?"
+
+    turn, reason = read_state("turn"), read_state("turn_reason")
+    if turn != "maintainer" or reason != "done":
+        if not force:
+            die(f"task '{task}' isn't finished (turn: {turn}, {reason}); finish it first, or pass --force")
+        warn(f"--force: merging unfinished task '{task}' (turn: {turn}, {reason})")
+    if wt.is_dir() and output("git", "-C", str(wt), "status", "--porcelain", check=False):
+        if not force:
+            die(
+                f"{wt} has uncommitted changes, which wouldn't be merged; "
+                "commit them in a turn, or pass --force to leave them behind"
+            )
+        warn(f"--force: uncommitted changes in {wt} are left behind")
+    worktrees = subprocess.run(["git", "-C", up, "worktree", "list", "--porcelain"], text=True, stdout=subprocess.PIPE)
+    if worktrees.returncode == 0 and f"branch refs/heads/{target}" in worktrees.stdout.split("\n"):
+        die(
+            f"'{target}' is checked out in {up}; sbx only moves branches that aren't checked out, so your working tree "
+            f"is never touched. Check out another branch there, or use --branch <other-name>"
+        )
+
+    # Bring the task's commits over under a private ref; no branch moves yet.
+    incoming = f"refs/sbx/incoming/{task}"
+    if subprocess.run(["git", "-C", up, "fetch", "-q", str(repo), f"+refs/heads/{br}:{incoming}"]).returncode != 0:
+        die(f"fetching {br} into {up} failed")
+
+    def drop_incoming() -> None:
+        run("git", "-C", up, "update-ref", "-d", incoming)
+
+    def indented(text: str, limit: int) -> None:
+        for line in text.split("\n")[:limit] if text else []:
+            print(f"  {line}")
+
+    new = ug("rev-parse", incoming)
+    old_proc = subprocess.run(
+        ["git", "-C", up, "rev-parse", "-q", "--verify", f"refs/heads/{target}"], text=True, stdout=subprocess.PIPE
+    )
+    old = old_proc.stdout.rstrip("\n")
+    if old_proc.returncode == 0:
+        if succeeds("git", "-C", up, "merge-base", "--is-ancestor", new, old):
+            drop_incoming()
+            print(f"nothing to merge: '{target}' in {up} already contains {br}")
+            return 0
+        action = "fast-forward" if succeeds("git", "-C", up, "merge-base", "--is-ancestor", old, new) else "merge"
+        count = ug("rev-list", "--count", f"{old}..{new}")
+        print(f"Task '{task}' from sandbox '{name}' -> branch '{target}' in {up} ({action}, {count} new commit(s)):")
+        indented(ug("log", "--oneline", f"{old}..{new}"), 40)
+        stat = ug("diff", "--stat", f"{old}...{new}")
+        for line in stat.split("\n")[-25:] if stat else []:
+            print(line)
+    else:
+        action = "create"
+        count = ug("rev-list", "--count", new, "--not", "--branches")
+        print(
+            f"Task '{task}' from sandbox '{name}' -> new branch '{target}' in {up} "
+            f"({count} commit(s) not on any branch there):"
+        )
+        indented(ug("log", "--oneline", new, "--not", "--branches"), 40)
+    sys.stdout.flush()
+
+    tree = ""
+    if action == "merge":
+        merged = subprocess.run(
+            ["git", "-C", up, "merge-tree", "--write-tree", "--name-only", old, new],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        out_lines = merged.stdout.rstrip("\n").split("\n")
+        if merged.returncode != 0:
+            drop_incoming()
+            # Conflicting paths: from the second line up to the first blank one.
+            conflicts = []
+            for i, line in enumerate(out_lines[1:]):
+                if i > 0 and not line:
+                    break
+                if line:
+                    conflicts.append(line)
+            print(f"sbx: merging into '{target}' would conflict in:", file=sys.stderr)
+            for line in conflicts:
+                print(f"  {line}", file=sys.stderr)
+            die(f"not merged. Merge into a fresh branch instead (--branch {target}-2), or resolve it by hand")
+        tree = out_lines[0]
+
+    if not yes:
+        print(f"Apply ({action}) to branch {target} in {up}? [y/N] ", end="", flush=True)
+        answer = sys.stdin.readline().strip()
+        if answer not in ("y", "Y", "yes"):
+            drop_incoming()
+            print("nothing changed")
+            return 0
+
+    ref = f"refs/heads/{target}"
+    if action == "create":
+        run("git", "-C", up, "update-ref", ref, new, "")
+    elif action == "fast-forward":
+        run("git", "-C", up, "update-ref", ref, new, old)
+    else:
+        commit = ug("commit-tree", tree, "-p", old, "-p", new, "-m", f"Merge sbx task '{task}' from sandbox '{name}'")
+        run("git", "-C", up, "update-ref", ref, commit, old)
+    drop_incoming()
+    short = ug("rev-parse", "--short", ref)
+    (repo / ".git" / "sbx" / task).mkdir(parents=True, exist_ok=True)
+    with open(repo / ".git" / "sbx" / task / "log", "a") as log:
+        log.write(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {action}: {br} -> {up}:{target} at {short}\n")
+    print(f"{action} done: '{target}' in {up} is now at {short}. Nothing was checked out or pushed.")
+    return 0
+
+
+def cmd_skills(args: list[str]) -> int:
+    name = need_name(args)
+    op = args[1] if len(args) > 1 and args[1] else "ls"
+    skills = args[2:]
+    dst = project_dir(name) / "skills"
+    if not dst.is_dir():
+        die(f"no sandbox '{name}' project dir ({dst})")
+    if op == "ls":
+        for entry in sorted(os.listdir(dst)):
+            if not entry.startswith("."):
+                print(entry)
+    elif op == "add":
+        for skill in skills:
+            if not (SBX_SKILLS_SRC / skill / "SKILL.md").is_file():
+                die(f"no skill '{skill}' in {SBX_SKILLS_SRC}")
+            shutil.rmtree(dst / skill, ignore_errors=True)
+            shutil.copytree(SBX_SKILLS_SRC / skill, dst / skill, symlinks=True)
+            print(f"added {skill}")
+    elif op == "rm":
+        for skill in skills:
+            target = dst / skill
+            if target.is_symlink() or target.is_file():
+                target.unlink()
+            else:
+                shutil.rmtree(target, ignore_errors=True)
+            print(f"removed {skill}")
+    else:
+        die("usage: sbx skills <name> [ls | add <skill>... | rm <skill>...]")
+    return 0
+
+
+def cmd_attach(args: list[str]) -> int:
+    name = need_name(args)
+    ensure_running(name)
+    exec_interactive("docker", "exec", "-it", cname(name), "tmux", "attach", "-t", "fleet")
+    return 0
+
+
+def cmd_shell(args: list[str]) -> int:
+    name = need_name(args)
+    ensure_running(name)
+    exec_interactive("docker", "exec", "-it", "-w", str(repo_dir(name)), cname(name), "bash")
+    return 0
+
+
+def cmd_root(args: list[str]) -> int:
+    name = need_name(args)
+    ensure_running(name)
+    exec_interactive("docker", "exec", "-it", "-u", "root", "-w", str(repo_dir(name)), cname(name), "bash")
+    return 0
+
+
+def cmd_login(args: list[str]) -> int:
+    name = need_name(args)
+    ensure_running(name)
+    exec_interactive("docker", "exec", "-it", "-w", str(repo_dir(name)), cname(name), "claude")
+    return 0
+
+
+def cmd_firewall(args: list[str]) -> int:
+    name = need_name(args)
+    if not firewall_on(name):
+        die(f"firewall is off for '{name}'")
+    ensure_running(name)
+    return 0 if apply_firewall(name) else 1
+
+
+def cmd_ports(args: list[str]) -> int:
+    name = need_name(args)
+    return subprocess.run(["docker", "port", cname(name)]).returncode
+
+
+def cmd_stop(args: list[str]) -> int:
+    name = need_name(args)
+    rc = subprocess.run(["docker", "stop", cname(name)], stdout=subprocess.DEVNULL).returncode
+    if rc == 0:
+        print("stopped")
+    return rc
+
+
+def cmd_ls(args: list[str]) -> int:
+    if not SBX_HOME.is_dir():
+        return 0
+    for repo in sorted(SBX_HOME.glob("*/repo")):
+        if not repo.is_dir() or repo.parent.name.startswith("."):
+            continue
+        name = repo.parent.name
+        status = subprocess.run(
+            ["docker", "inspect", "-f", "{{.State.Status}}", cname(name)],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        state = status.stdout.rstrip("\n") if status.returncode == 0 else "absent"
+        print(f"{name:<20} {state:<10} firewall={'on' if firewall_on(name) else 'OFF':<4} {repo}")
+    return 0
+
+
+def cmd_rm(args: list[str]) -> int:
+    name = need_name(args)
+    succeeds("docker", "rm", "-f", cname(name))
+    succeeds("docker", "volume", "rm", f"sbx-{name}-cache")
+    print(f"container removed; the clone is kept at {repo_dir(name)} (delete it yourself if you're done)")
+    return 0
+
+
+# ---- help -------------------------------------------------------------------
+
+COMMANDS = [
+    Command(
+        "build",
+        "[docker build args]",
+        "build the image (again, to update Claude Code)",
+        """
+        Builds the image ($SBX_IMAGE, default claude-sandbox:latest) from this
+        directory's Dockerfile: Ubuntu 24.04, Node, Claude Code, Foundry, Slither,
+        tmux and the firewall tools. Extra arguments go to 'docker build'. 'sbx new'
+        builds it automatically if it's missing. Claude Code inside never
+        auto-updates; rebuild to update it (running containers keep the old image
+        until 'sbx rm' and a restart).
+
+        examples:
+          sbx build
+          sbx build --build-arg WITH_FOUNDRY=0 --build-arg WITH_SLITHER=0
+          sbx build --build-arg SLITHER_VERSION=0.10.4
+        """,
+        cmd_build,
+    ),
+    Command(
+        "new",
+        "<name> <src> [branch]",
+        "clone <src> into $SBX_HOME/<name>/repo and start its container",
+        """
+        Creates a sandbox: clones <src> (a git URL or a local path; optionally one
+        [branch]) into $SBX_HOME/<name>/repo, then starts its container (building the
+        image first if needed) with the firewall up. Fails if the clone already exists.
+
+        When <src> is a local repo, the clone's 'origin' is renamed 'host' (that's
+        where 'sbx merge' brings work back) and a new 'origin' points at the local
+        repo's own origin, for fetching. .worktrees/ is excluded from git.
+
+        The firewall setting is fixed at creation: SBX_FIREWALL=0 creates the sandbox
+        without it. On success it prints the next steps (login, agent, attach).
+
+        examples:
+          sbx new proto ~/code/some-repo
+          sbx new proto git@github.com:org/repo.git develop
+          SBX_FIREWALL=0 sbx new scratch ~/code/some-repo
+        """,
+        cmd_new,
+    ),
+    Command(
+        "login",
+        "<name>",
+        "start claude to log in (once; shared by all sandboxes)",
+        """
+        Opens Claude Code interactively in the sandbox so you can log in. The login is
+        stored in a Docker volume ($SBX_CONFIG_VOLUME) that every sandbox shares, so
+        you do this once. Exit claude when you're done.
+        """,
+        cmd_login,
+    ),
+    Command(
+        "agent",
+        "<name> [task] [--role R] [claude args...]",
+        "start an agent in its own tmux window and worktree",
+        """
+        Starts Claude Code (with --dangerously-skip-permissions; the container is the
+        sandbox) in a new window of the sandbox's tmux session 'fleet'.
+
+          task        the agent works in .worktrees/<task> on branch agent/<task>
+                      (created from the host if needed; an existing branch is reused).
+                      Omit it to work in the main checkout (window 'main').
+          --role R    tester, builder or reviewer: join the task's team. Must come
+                      right after the task. Starts the task's bus (bus init), names
+                      the window <task>-<role>, exports SBX_TASK and SBX_ROLE, and
+                      appends the role's prompt (role-prompt R) to claude's system
+                      prompt. Needs a task: the team shares its worktree.
+          claude args everything else goes to claude, e.g. the first prompt.
+
+        When claude exits the window drops to a bash shell, so you can see what
+        happened. Prints the worktree and branch; watch it with 'sbx attach'.
+
+        examples:
+          sbx agent proto api "build the REST API"
+          sbx agent proto ui --model opus "build the frontend"
+          sbx agent proto vault --role reviewer "join the team"
+          sbx agent proto
+        """,
+        cmd_agent,
+    ),
+    Command(
+        "tdd",
+        "<name> <task> <spec>",
+        "start a tester, builder and reviewer team on one task",
+        """
+        Starts the team on .worktrees/<task>: a builder and a reviewer (skipped when
+        the config says 'seats = none'), told to wait for their turn, then a tester,
+        who holds the first turn and gets <spec>: the spec itself, or a path to it in
+        the repo. If the config says 'proxy = on', also starts the proxy.
+
+        Then follow along with 'sbx attach', 'sbx inbox' and 'sbx bus <name> <task> status'.
+
+        example:
+          sbx tdd proto vault "implement docs/vault-spec.md"
+        """,
+        cmd_tdd,
+    ),
+    Command(
+        "bus",
+        "<name> <task> <bus args>",
+        "the task's message bus, as the maintainer",
+        """
+        Runs 'bus <bus args>' inside the container, in the task's worktree, as the
+        maintainer (SBX_ROLE=maintainer). stdin is passed through, so '-' reads the
+        text from your terminal or a pipe. As the maintainer you hand off with no gate,
+        can open chores, and can release a task at any point. See 'bin/bus help'.
+
+          status                          whose turn, since when and why, round, last panel
+          read                            your unread messages for this task
+          send <role> "text"              talk without passing the turn
+          handoff <role> "instructions"   give the turn to a role (no gate for you)
+          handoff builder --chore "what"  a chore: no tests to write, green + panel still apply
+          done "note"                     release the task as done
+          log                             the task's event log
+
+        examples:
+          sbx bus proto vault status
+          sbx bus proto vault handoff builder "the spec means X; implement it that way"
+          sbx bus proto docs handoff builder --chore "update the README for the new API"
+        """,
+        cmd_bus,
+    ),
+    Command(
+        "inbox",
+        "<name>",
+        "your unread messages from every team",
+        """
+        For every task of the sandbox with unread mail for the maintainer (escalations,
+        'done' reports, overrides, proxy reports), prints '##### task <task>' and
+        the messages, and marks them read. Prints "(no unread messages)" otherwise.
+        """,
+        cmd_inbox,
+    ),
+    Command(
+        "proxy",
+        "<name>",
+        "start the proxy (stands in for you on escalations; config 'proxy = on')",
+        """
+        Starts the proxy loop in the fleet's 'proxy' tmux window: one per sandbox,
+        watching every task. It acts only while the project config says 'proxy = on'
+        (reread every 30s), on escalations that have waited proxy_grace seconds, at
+        most proxy_max times per task. 'sbx tdd' starts it when the config has it on.
+        Says so if it's already running.
+        """,
+        cmd_proxy,
+    ),
+    Command(
+        "skills",
+        "<name> [ls | add <skill>... | rm <skill>...]",
+        "stack skills for this sandbox, copied from $SBX_SKILLS_SRC",
+        """
+        Each sandbox sees only the skills you give it: $SBX_HOME/<name>/project/skills
+        is mounted over ~/.claude/skills in the container. Changes are visible at once.
+
+          ls                list this sandbox's skills (the default)
+          add <skill>...    copy each skill from $SBX_SKILLS_SRC (default ~/.claude/skills),
+                            replacing an older copy; it must have a SKILL.md
+          rm <skill>...     remove each skill
+
+        Which role is told to use which skill is in the config (skills.<role>).
+
+        example:
+          sbx skills proto add x-ray fizz solidity-auditor
+        """,
+        cmd_skills,
+    ),
+    Command(
+        "merge",
+        "<name> <task> [--branch B] [--yes] [--force]",
+        "put a finished task's work on its own branch in the repo you cloned from",
+        """
+        Brings a finished team task back to the repo the sandbox was cloned from (the
+        clone's 'host' remote), on the task's own branch there: <task>, or --branch B.
+        It never touches that repo's working tree or index, so uncommitted work there
+        doesn't matter, and it never pushes.
+
+        It shows what it will do (create the branch, fast-forward it, or build a merge
+        commit), the commits and a diffstat, then asks "Apply ...? [y/N]" (--yes / -y
+        skips the question). It refuses:
+          - if the task isn't finished (the tester's 'bus done', a passed chore, or your
+            own release); --force merges anyway
+          - if the task's worktree has uncommitted changes; --force leaves them behind
+          - if the branch is checked out in that repo (pick another with --branch)
+          - if the merge would conflict (it lists the files; try --branch <task>-2)
+        If the branch already contains the work it says "nothing to merge". Each merge
+        is logged in the task's bus log directory.
+
+        examples:
+          sbx merge proto vault
+          sbx merge proto vault --branch feature/vault --yes
+        """,
+        cmd_merge,
+    ),
+    Command(
+        "attach",
+        "<name>",
+        "attach to the fleet's tmux session (detach: Ctrl-b d)",
+        """
+        Each agent is a window: Ctrl-b <n> or Ctrl-b w to switch, Ctrl-b d to detach
+        (the agents keep running). The mouse works for selecting and scrolling.
+        """,
+        cmd_attach,
+    ),
+    Command(
+        "shell",
+        "<name>",
+        "bash in the container as the agents' user",
+        """
+        A shell in the main checkout, as 'ubuntu' (the agents' user). Use it to run
+        the clone's code (npm install, forge test, dev servers) sandboxed instead of
+        on your Mac.
+        """,
+        cmd_shell,
+    ),
+    Command(
+        "root",
+        "<name>",
+        "root bash in the container (apt-get install etc.)",
+        """
+        A root shell in the main checkout. Agents have no general sudo; install system
+        packages for them from here. Packages are lost when the container is recreated.
+        """,
+        cmd_root,
+    ),
+    Command(
+        "firewall",
+        "<name>",
+        "re-apply the firewall (after editing an allowlist, or to refresh IPs)",
+        """
+        Re-resolves every allowlisted domain and swaps the new address set in
+        atomically. Run it after editing allowlist/default.txt or
+        $SBX_HOME/<name>/allowlist/*.txt, or when a host that worked starts failing
+        (CDN IPs rotate). Refuses for a sandbox created without the firewall.
+        """,
+        cmd_firewall,
+    ),
+    Command(
+        "ports",
+        "<name>",
+        "show which host ports the dev ports landed on",
+        """
+        The container's ports ($SBX_PORTS, default 3000 5173 8000 8545) are published
+        on 127.0.0.1 at random host ports; this shows the mapping.
+        """,
+        cmd_ports,
+    ),
+    Command(
+        "ls",
+        "",
+        "list sandboxes: name, container state, firewall, clone",
+        """
+        One line per sandbox in $SBX_HOME: its name, its container's state (running,
+        exited, absent...), whether the firewall is on, and the clone's path.
+        """,
+        cmd_ls,
+    ),
+    Command(
+        "stop",
+        "<name>",
+        "stop the container (the clone and its state are kept)",
+        """
+        Any later command that needs the container ('attach', 'agent', ...) starts it
+        again and re-applies the firewall. The agents' tmux windows don't survive.
+        """,
+        cmd_stop,
+    ),
+    Command(
+        "rm",
+        "<name>",
+        "remove the container and its cache volume; the clone is kept",
+        """
+        Removes the container and its ~/.cache volume. The clone, its worktrees, the
+        bus state and the project config stay in $SBX_HOME/<name>; delete that folder
+        yourself when you're done. Any later command recreates the container (that's
+        also how a sandbox picks up a rebuilt image).
+        """,
+        cmd_rm,
+    ),
+]
+
+CLI(
+    "sbx",
+    """
+Run fleets of Claude Code agents in a sandboxed Ubuntu container, each sandbox
+working on its own dedicated clone of a project.
+""",
+    COMMANDS,
+    footer=f"""Per-sandbox gate config, role notes and skills: $SBX_HOME/<name>/project/
+Environment: SBX_HOME, SBX_IMAGE, SBX_PORTS, SBX_MEMORY (8g), SBX_CPUS (6), SBX_FIREWALL (1),
+             SBX_CONFIG_VOLUME, SBX_SKILLS_SRC
+SBX_HOME={SBX_HOME}""",
+    default="overview",
+    unknown="die",
+).run()

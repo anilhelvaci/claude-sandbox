@@ -1,0 +1,41 @@
+# Tooling config only: claude-sandbox isn't a package. Lint and format with Ruff:
+#   uvx ruff check .          report problems
+#   uvx ruff check --fix .    fix what's safe to fix (unused imports, import order...)
+#   uvx ruff format .         format the code
+
+[tool.ruff]
+target-version = "py39"   # the host may run macOS's system python3 (3.9)
+line-length = 120
+# The scripts have no .py extension (they're commands on PATH), so list them.
+extend-include = [
+    "sbx",
+    "init-firewall",
+    "bin/bus",
+    "bin/gate",
+    "bin/panel",
+    "bin/proxy",
+    "bin/role-prompt",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes: unused imports and variables, undefined names
+    "I",   # import sorting
+    "UP",  # pyupgrade: modern syntax for the target version
+    "B",   # bugbear: likely bugs
+]
+
+[tool.pyright]
+# For Pylance/Pyright in the IDE. 'sbx' adds bin/ to sys.path at runtime, and the
+# scripts in bin/ import sbx_lib and sbx_cli from their own directory.
+pythonVersion = "3.9"
+extraPaths = ["bin"]
+# basedpyright reads this section too. Its default is its strictest mode, which flags
+# every unused call result (f.write(...), subprocess.run(...)) and every Any;
+# "standard" is what Pylance in VS Code uses.
+typeCheckingMode = "standard"
+
+[tool.ruff.lint.isort]
+known-first-party = ["sbx_lib", "sbx_cli"]

@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""role-prompt <role>: print the system prompt for a role agent.
+
+sbx agent passes it to claude via --append-system-prompt.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import sys
+from pathlib import Path
+
+import sbx_lib as lib
+
+HELP = """\
+usage: role-prompt <role>
+
+Print the system prompt for a role agent (tester, builder or reviewer). 'sbx agent
+--role <role>' appends it to claude's system prompt; run it yourself to see exactly
+what an agent was told.
+
+Three layers, as in garden:
+  1. the generic role brief: /opt/sbx/roles/COMMON.md, then /opt/sbx/roles/<role>.md
+  2. the project's stack skills wired to the role (config 'skills.<role>'), each with
+     the description from its SKILL.md, or a NOT INSTALLED warning
+  3. the project's notes for the role ($SBX_PROJECT/<role>.md) and the gate config
+Roles stay stack-agnostic; the specialization is all in the project layer. It ends
+with the role, the task and the worktree.
+"""
+
+
+def main() -> int:
+    if len(sys.argv) < 2 or not sys.argv[1]:
+        lib.die("usage: role-prompt <role>")
+    if sys.argv[1] in ("-h", "--help", "help"):
+        print(HELP, end="")
+        return 0
+    role = sys.argv[1]
+    brief = lib.SBX_ROOT / "roles" / f"{role}.md"
+    if not brief.is_file():
+        lib.die(f"no role '{role}' ({brief})")
+    out = sys.stdout
+
+    # Layer 1: the generic role brief.
+    out.write((lib.SBX_ROOT / "roles" / "COMMON.md").read_text())
+    out.write("\n\n")
+    out.write(brief.read_text())
+
+    # Layer 2: the stack skills wired to this role.
+    skills = lib.conf_get(f"skills.{role}")
+    out.write(f"\n\n# Project specialization\n\nStack: {lib.conf_get('stack', 'generic')}.\n")
+    if skills:
+        out.write(
+            "\nThis project wires these skills to your role. Use them (invoke them with the Skill tool, or read "
+            "~/.claude/skills/<name>/SKILL.md and its references) where your procedure calls for stack expertise:\n\n"
+        )
+        for skill in skills.split():
+            skill_md = Path.home() / ".claude" / "skills" / skill / "SKILL.md"
+            if skill_md.is_file():
+                lines = lib.split_lines(skill_md.read_text())
+                desc = next(
+                    (re.sub(r"^description:\s*", "", line) for line in lines if line.startswith("description:")), ""
+                )
+                out.write(f"- **{skill}**: {desc[:240]}\n")
+            else:
+                out.write(
+                    f"- **{skill}**: NOT INSTALLED in this sandbox. Tell the maintainer (bus send maintainer ...); "
+                    "they add it with sbx skills.\n"
+                )
+
+    # Layer 3: the project's notes for the role, and the gate config.
+    notes = lib.SBX_PROJECT / f"{role}.md"
+    if notes.is_file():
+        out.write(f"\n## Project notes for the {role}\n\n")
+        out.write(notes.read_text())
+    config = lib.SBX_PROJECT / "config"
+    if config.is_file():
+        out.write("\n## Project gate config (read-only; what `gate` runs)\n\n```\n")
+        for line in lib.split_lines(config.read_text()):
+            if line.strip() and not line.lstrip().startswith("#"):
+                out.write(line + "\n")
+        out.write("```\n")
+
+    out.write(f"\n# You\n\nRole: {role}. Task: {lib.task_name()}. Worktree: {os.getcwd()}.\n")
+    return 0
+
+
+sys.exit(main())

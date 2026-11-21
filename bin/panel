@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""panel: run the reviewer seats over the cycle's diff and aggregate the verdict.
+
+Adapted from garden's scripted jury panel: the script owns the control flow and
+each seat is one narrow 'claude -p' call with a fresh context.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import sbx_lib as lib
+
+HELP = """\
+usage: panel [base]
+
+Run the reviewer seats over the cycle's diff and aggregate the verdict.
+
+Each seat (config 'seats', default: prover saboteur breaker corner-prober; briefs
+in /opt/sbx/roles/jurors/) is one 'claude -p' call with a fresh context and
+read-only tools, all running at once, each reviewing 'git diff <base> HEAD'
+through its own lens. A seat that doesn't produce a FINDINGS block is retried
+once. It takes a few minutes; give it a 30-minute Bash timeout.
+
+  base   defaults to the open cycle's base (then to the turn's base)
+
+Each seat ends its output with lines of the form
+  path/to/file:LINE: [must-fix|should-fix|comment] message
+The aggregate (<bus>/reviews/latest/findings.txt) keeps that format, adding the
+seat's name, so editors (VS Code problem matchers, vim quickfix) can jump to each
+finding. Every run is kept in <bus>/reviews/<timestamp>/ (each seat's output and
+errors, findings.txt, base, head, verdict); reviews/latest points at the newest.
+
+Verdict, decided without an LLM: 'changes' if any seat has a must-fix, else
+'pass'. An empty diff passes at once, without calling any seat.
+Exit: 0 pass, 3 changes, 1 error (a seat failed).
+
+Config keys: seats ('none' disables the panel), seat_timeout (seconds, default
+900), seat_model, stack, skills.reviewer; project notes from reviewer.md.
+"""
+
+TOOLS = "Read,Grep,Glob,Bash(git diff:*),Bash(git show:*),Bash(git log:*)"
+FINDING = re.compile(r"^\S+:[0-9]+: \[(must-fix|should-fix|comment)\]")
+FINDING_TAG = re.compile(r"^(\S+:[0-9]+: \[[a-z-]+\]) ")
+
+OUTPUT_INSTRUCTIONS = """
+## Output
+Write at most ~400 words of reasoning, then a line containing only FINDINGS:, then one
+line per finding, exactly in this form (path relative to the repo root):
+
+path/to/file:LINE: [must-fix|should-fix|comment] what is wrong and what to do
+
+must-fix is for real defects in what the change claims; don't inflate. If you find
+nothing, write FINDINGS: followed by the single line: none
+"""
+
+
+def seat_prompt(seat: str, base: str, head: str, stack: str, skills: str) -> str:
+    brief = lib.SBX_ROOT / "roles" / "jurors" / f"{seat}.md"
+    if not brief.is_file():
+        raise FileNotFoundError(f"no juror brief for seat '{seat}' ({brief})")
+    parts = [
+        "You are one seat on a code-review panel. Review ONLY through your seat's lens.\n",
+        "\n",
+        lib.read_text(brief, "") + "\n",
+        "\n",
+        "## This review\n",
+        f"- Repository: {os.getcwd()}, stack: {stack}\n",
+        f"- Diff under review: `git diff {base} {head}` (read it with that command; open files as needed).\n",
+        f"- Shared disciplines: {lib.SBX_ROOT}/skills/ (regression-evidence.md, adversarial-tests.md).\n",
+    ]
+    if skills:
+        parts.append(
+            "- Stack expertise: consult these skills' checklists and references "
+            "(read the files; don't run the skill):\n"
+        )
+        parts += [f"  - ~/.claude/skills/{s}/ (start at SKILL.md)\n" for s in skills.split()]
+    notes = lib.SBX_PROJECT / "reviewer.md"
+    if notes.is_file():
+        parts.append(f"\n## Project notes\n{lib.read_text(notes, '')}\n")
+    parts.append(OUTPUT_INSTRUCTIONS)
+    return "".join(parts).rstrip("\n")
+
+
+def has_findings_block(path: Path) -> bool:
+    try:
+        return any(line.startswith("FINDINGS:") for line in lib.split_lines(path.read_text(errors="replace")))
+    except OSError:
+        return False
+
+
+def run_seat(seat: str, run: Path, prompt_args: tuple[str, str, str, str], timeout_s: str, model: str) -> bool:
+    """One seat: up to two 'claude -p' attempts; True once its output has a FINDINGS block."""
+    try:
+        prompt = seat_prompt(seat, *prompt_args)
+    except FileNotFoundError as e:
+        print(f"panel: {e}", file=sys.stderr)
+        return False
+    cmd = ["timeout", timeout_s, "claude", "-p", prompt, "--allowedTools", TOOLS]
+    if model:
+        cmd += ["--model", model]
+    for attempt in (1, 2):
+        with open(run / f"{seat}.md", "w") as out, open(run / f"{seat}.err", "w") as err:
+            rc = subprocess.run(cmd, stdout=out, stderr=err).returncode
+        if rc == 0 and has_findings_block(run / f"{seat}.md"):
+            return True
+        print(f"  seat {seat}: attempt {attempt} gave no FINDINGS block, retrying", file=sys.stderr)
+    return False
+
+
+def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help", "help"):
+        print(HELP, end="")
+        return 0
+    bus = lib.bus_dir()
+    base = (sys.argv[1] if len(sys.argv) > 1 else "") or lib.state_get("cycle_base") or lib.state_get("turn_base")
+    if not base:
+        lib.die("no base: pass one, or start the task with 'bus init'")
+    head = lib.git("rev-parse", "HEAD")
+    seats = lib.conf_get("seats", "prover saboteur breaker corner-prober")
+    if seats == "none":
+        lib.die("the project config has 'seats = none'")
+    timeout_s = lib.conf_get("seat_timeout", "900")
+    model = lib.conf_get("seat_model")
+    stack = lib.conf_get("stack", "generic")
+    skills = lib.conf_get("skills.reviewer")
+
+    run = bus / "reviews" / lib.stamp()
+    run.mkdir(parents=True, exist_ok=True)
+    (run / "head").write_text(head + "\n")
+    (run / "base").write_text(base + "\n")
+
+    def finish(verdict: str) -> None:
+        (run / "verdict").write_text(verdict + "\n")
+        latest = bus / "reviews" / "latest"
+        if latest.is_symlink() or latest.exists():
+            latest.unlink()
+        latest.symlink_to(run.name)
+        lib.log_event(f"panel: {verdict} on {head[:10]} ({run})")
+        print(f"verdict: {verdict}   ({run})")
+
+    # Garden's short-circuit: nothing to judge, no LLM spent.
+    if subprocess.run(["git", "diff", "--quiet", base, "HEAD"]).returncode == 0:
+        (run / "findings.txt").write_text("")
+        print(f"empty diff {base[:10]}..{head[:10]}")
+        finish("pass")
+        return 0
+
+    seat_list = seats.split()
+    print(f"panel over {base[:10]}..{head[:10]}: {seats}", flush=True)
+    with ThreadPoolExecutor(max_workers=len(seat_list)) as pool:
+        results = list(pool.map(lambda s: run_seat(s, run, (base, head, stack, skills), timeout_s, model), seat_list))
+    failed = not all(results)
+
+    # Aggregate in seat order, so the file is the same however the seats interleaved.
+    findings_file = run / "findings.txt"
+    findings_file.write_text("")
+    for seat in seat_list:
+        output = run / f"{seat}.md"
+        if not has_findings_block(output):
+            print(f"  seat {seat} FAILED (see {run}/{seat}.err)")
+            failed = True
+            continue
+        lines = lib.split_lines(output.read_text(errors="replace"))
+        start = next(i for i, line in enumerate(lines) if line.startswith("FINDINGS:"))
+        found = [
+            FINDING_TAG.sub(lambda m, seat=seat: f"{m.group(1)} ({seat}) ", line, count=1)
+            for line in lines[start:]
+            if FINDING.match(line)
+        ]
+        with open(findings_file, "a") as f:
+            f.writelines(line + "\n" for line in found)
+        count = sum(f"({seat})" in line for line in lib.split_lines(findings_file.read_text()))
+        print(f"  {seat:<14} {count} finding(s)")
+
+    if failed:
+        finish("error")
+        lib.die("a seat failed; the verdict is 'error' (fix and rerun 'panel')")
+    findings = findings_file.read_text()
+    sys.stdout.write(findings)
+    if "[must-fix]" in findings:
+        finish("changes")
+        return 3
+    finish("pass")
+    return 0
+
+
+sys.exit(main())

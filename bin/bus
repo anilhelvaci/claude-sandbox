@@ -1,0 +1,625 @@
+#!/usr/bin/env python3
+"""bus: message bus and turn-taking for one task's agents (tester, builder,
+reviewer) plus the maintainer.
+
+Adapted from garden's journal message bus, but local: a directory under the
+clone's shared .git (<clone>/.git/sbx/<task>/), with atomic renames:
+
+    inbox/<role>/unread/*.md   messages not yet read     inbox/<role>/read/  read ones
+    state/<key>                turn, turn_base, turn_at, turn_reason, round, cycle_base,
+                               cycle_tests, chore, proxy_* (one small file each)
+    log                        the task's event log
+    reviews/                   panel runs (reviews/latest -> the newest)
+    gate/                      gate logs
+
+Who you are comes from SBX_ROLE (and SBX_TASK); sbx agent sets both.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import os
+import random
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import sbx_lib as lib
+from sbx_cli import CLI, Command
+
+ME = os.environ.get("SBX_ROLE", "")
+ROLES = ["tester", "builder", "reviewer", "maintainer"]
+GATE = str(Path(__file__).resolve().parent / "gate")
+DEFAULT_SEATS = "prover saboteur breaker corner-prober"
+
+_lock_file = None  # held until the process exits
+
+
+# ---- helpers ----------------------------------------------------------------
+
+
+def need_me() -> None:
+    if not ME:
+        lib.die("SBX_ROLE is not set (sbx agent sets it; the maintainer uses 'sbx bus')")
+
+
+def valid_role(role: str) -> None:
+    if role not in ROLES:
+        lib.die(f"unknown role '{role}' (one of: {' '.join(ROLES)})")
+
+
+def body_from(args: list[str]) -> str:
+    """The remaining args as text, or stdin when the first arg is '-'."""
+    if args and args[0] == "-":
+        return sys.stdin.read().rstrip("\n")
+    return " ".join(args).rstrip("\n")
+
+
+def head(short: bool = False) -> str:
+    return lib.git("rev-parse", "--short", "HEAD") if short else lib.git("rev-parse", "HEAD")
+
+
+def deliver(to: str, kind: str, body: str) -> None:
+    """Drop a message into <to>'s unread inbox (atomically), log it, wake <to>."""
+    bus = lib.bus_dir()
+    msg_id = f"{lib.stamp()}-{os.getpid()}-{random.randint(0, 32767)}"
+    for d in (bus / "tmp", bus / "inbox" / to / "unread", bus / "inbox" / to / "read"):
+        d.mkdir(parents=True, exist_ok=True)
+    tmp = bus / "tmp" / f"{msg_id}.md"
+    tmp.write_text(
+        f"---\nfrom: {ME or '?'}\nto: {to}\nkind: {kind}\nsent_at: {lib.now()}\nhead: {head(short=True)}\n---\n{body}\n"
+    )
+    os.replace(tmp, bus / "inbox" / to / "unread" / f"{msg_id}.md")
+    lib.log_event(f"{kind} {ME or '?'} -> {to} ({msg_id})")
+    nudge(to, kind)
+
+
+def nudge(to: str, kind: str) -> None:
+    """Wake the recipient: interactive agents end their turn and sit idle, so type
+    a one-line prompt into its tmux window (Claude Code queues it if it's busy)."""
+    if (os.environ.get("SBX_BUS_NUDGE") or "1") != "1" or to == "maintainer":
+        return
+    window = f"{lib.task_name()}-{to}"
+    windows = subprocess.run(
+        ["tmux", "list-windows", "-t", "fleet", "-F", "#W"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    if window not in lib.split_lines(windows.stdout):
+        return
+    target = f"fleet:{window}"
+    for keys in (["-l", f"[bus] {kind} from {ME or '?'}: run 'bus read'"], ["Enter"]):
+        rc = subprocess.run(["tmux", "send-keys", "-t", target, *keys]).returncode
+        if rc != 0:
+            sys.exit(rc)
+
+
+def with_lock() -> None:
+    """Serialize state changes across agents (an exclusive flock on <bus>/lock)."""
+    global _lock_file
+    bus = lib.bus_dir()
+    bus.mkdir(parents=True, exist_ok=True)
+    _lock_file = open(bus / "lock", "w")
+    fcntl.flock(_lock_file, fcntl.LOCK_EX)
+
+
+def set_turn(role: str, reason: str) -> None:
+    """Every turn change records when and why, so the proxy can tell an
+    escalation (eligible after its grace period) from a finished task."""
+    lib.state_set("turn", role)
+    lib.state_set("turn_base", head())
+    lib.state_set("turn_at", str(int(time.time())))
+    lib.state_set("turn_reason", reason)
+
+
+def unread(role: str) -> list[Path]:
+    return sorted((lib.bus_dir() / "inbox" / role / "unread").glob("*.md"))
+
+
+# ---- commands ---------------------------------------------------------------
+
+
+def cmd_init(args: list[str]) -> int:
+    with_lock()
+    if not lib.state_get("turn"):
+        set_turn("tester", "start")
+        lib.state_set("round", "0")
+        lib.log_event(f"init: task started at {head(short=True)}, turn = tester")
+        print(f"task '{lib.task_name()}' started; tester holds the turn")
+    return 0
+
+
+def cmd_send(args: list[str]) -> int:
+    need_me()
+    if not args or not args[0]:
+        lib.die("usage: bus send <to> [-k kind] [text|-]")
+    to, args = args[0], args[1:]
+    valid_role(to)
+    kind = "message"
+    if args and args[0] == "-k":
+        if len(args) < 2 or not args[1]:
+            lib.die("-k needs a kind")
+        kind, args = args[1], args[2:]
+    body = body_from(args)
+    if not body:
+        lib.die("empty message")
+    deliver(to, kind, body)
+    print(f"sent to {to}")
+    return 0
+
+
+def cmd_read(args: list[str]) -> int:
+    need_me()
+    inbox = lib.bus_dir() / "inbox" / ME
+    (inbox / "unread").mkdir(parents=True, exist_ok=True)
+    (inbox / "read").mkdir(parents=True, exist_ok=True)
+    messages = unread(ME)
+    for f in messages:
+        print(f"=== {f.stem}")
+        sys.stdout.write(f.read_text())
+        print()
+        os.replace(f, inbox / "read" / f.name)
+    if not messages:
+        print("(no unread messages)")
+    print(f"turn: {lib.state_get('turn', '(not started)')}")
+    return 0
+
+
+def cmd_wait(args: list[str]) -> int:
+    need_me()
+    limit = int(args[0]) if args and args[0] else 540
+    waited = 0
+    while waited < limit:
+        if unread(ME):
+            print("you have mail: run 'bus read'")
+            return 0
+        time.sleep(3)
+        waited += 3
+    print(f"no mail after {limit}s (turn: {lib.state_get('turn')})")
+    return 1
+
+
+def cmd_status(args: list[str]) -> int:
+    bus = lib.bus_dir()
+    at = lib.state_get("turn_at")
+    ago = f"{(int(time.time()) - int(at)) // 60} min ago, " if at else ""
+    chore = "   (chore cycle)" if lib.state_get("chore") else ""
+    print(f"task:       {lib.task_name()}   ({bus})")
+    print(f"turn:       {lib.state_get('turn', '(not started)')}   ({ago}{lib.state_get('turn_reason', '?')})")
+    print(f"turn base:  {lib.state_get('turn_base', '-')}")
+    rounds = f"{lib.state_get('round', '0')}/{lib.conf_get('max_rounds', '4')}"
+    print(f"cycle base: {lib.state_get('cycle_base', '-')}   round {rounds}")
+    print(f"red tests:  {lib.state_get('cycle_tests', '-')}{chore}")
+    budget = f"{lib.state_get('proxy_count', '0')}/{lib.conf_get('proxy_max', '3')}"
+    print(f"proxy:      {lib.conf_get('proxy', 'off')}, {budget} interventions used")
+    for role in ROLES:
+        box = bus / "inbox" / role / "unread"
+        count = len([n for n in os.listdir(box) if not n.startswith(".")]) if box.is_dir() else 0
+        print(f"  {role:<10} {count} unread")
+    latest = bus / "reviews" / "latest"
+    if (latest / "verdict").exists():
+        print(f"last panel: {lib.read_text(latest / 'verdict', '')} on {lib.read_text(latest / 'head', '')[:10]}")
+    return 0
+
+
+def cmd_log(args: list[str]) -> int:
+    log = lib.bus_dir() / "log"
+    try:
+        sys.stdout.write(log.read_text())
+    except OSError:
+        print("(empty)")
+    return 0
+
+
+def cmd_escalate(args: list[str]) -> int:
+    need_me()
+    body = body_from(args)
+    with_lock()
+    set_turn("maintainer", "escalation")
+    deliver("maintainer", "escalation", body or f"({ME} escalated without a note)")
+    print("turn passed to the maintainer")
+    return 0
+
+
+def cmd_done(args: list[str]) -> int:
+    need_me()
+    body = body_from(args)
+    turn = lib.state_get("turn")
+    if ME == "tester":
+        if turn != "tester":
+            lib.die(f"it's the {turn}'s turn, not yours")
+        with_lock()
+        set_turn("maintainer", "done")
+        deliver("maintainer", "done", body or "(the tester declared the task done without a summary)")
+        print("task marked done; the turn rests with the maintainer")
+    elif ME == "maintainer":
+        # The maintainer can release a task whenever they choose: after a
+        # follow-up question, or mid-cycle. Open cycle state is kept, so handing
+        # the turn back later resumes where it stopped.
+        with_lock()
+        set_turn("maintainer", "done")
+        lib.log_event(f"released: the maintainer marked the task done (turn was: {turn or 'none'})")
+        if turn and turn != "maintainer":
+            note = "The maintainer released this task; it's done. Stop work on it, and don't commit or hand off."
+            if body:
+                note += f"\n\n{body}"
+            deliver(turn, "released", note)
+            print(f"the {turn} held the turn and has been told to stop")
+        if lib.state_get("cycle_base"):
+            print("note: a cycle was open; its state is kept, so handing the turn back resumes it")
+        print("task released as done")
+    else:
+        lib.die("only the tester (spec covered) or the maintainer (release) marks a task done")
+    return 0
+
+
+def cmd_handoff(args: list[str]) -> int:
+    need_me()
+    if not args or not args[0]:
+        lib.die("usage: bus handoff <to> [opts] [text|-]")
+    to, args = args[0], args[1:]
+    valid_role(to)
+
+    # Options come right after <to>; the first non-option starts the note.
+    defensive = review = override = ""
+    dry_run = chore = False
+    while args:
+        opt = args[0]
+        if opt in ("--defensive", "--review", "--override"):
+            if len(args) < 2 or not args[1]:
+                lib.die(f"{opt} needs a value")
+            if opt == "--defensive":
+                defensive = args[1]
+            elif opt == "--review":
+                review = args[1]
+            else:
+                override = args[1]
+            args = args[2:]
+        elif opt == "--dry-run":
+            dry_run, args = True, args[1:]
+        elif opt == "--chore":
+            chore, args = True, args[1:]
+        else:
+            break
+    note = body_from(args)
+
+    bus = lib.bus_dir()
+    turn, base, head_sha = lib.state_get("turn"), lib.state_get("turn_base"), head()
+    if not turn:
+        lib.die("task not started; run 'bus init'")
+
+    # Who may hand off now.
+    if ME == "maintainer":
+        pass
+    elif ME == "proxy":
+        if not (turn == "maintainer" and lib.state_get("turn_reason") != "done"):
+            lib.die(f"the proxy acts only on an escalation (turn: {turn}, {lib.state_get('turn_reason', '?')})")
+    elif turn != ME:
+        lib.die(f"it's the {turn}'s turn, not yours ({ME}); use 'bus send' to talk")
+    if to == ME:
+        lib.die("can't hand off to yourself")
+
+    seats = lib.conf_get("seats", DEFAULT_SEATS)
+    if lib.conf_get("seats", "x") == "none":
+        seats = ""
+
+    report: list[str] = []  # the gate transcript, shown here and sent with the handoff
+    gate_ok = True
+    kind, reason = "handoff", "handoff"
+    closes = opens = bump = False
+
+    def gate(*gate_args: str) -> None:
+        nonlocal gate_ok
+        report.append(f"$ gate {' '.join(gate_args)}\n")
+        proc = subprocess.run([GATE, *gate_args], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        report.append(proc.stdout)
+        if proc.returncode != 0:
+            gate_ok = False
+
+    transition = f"{ME}>{to}"
+    if chore:
+        if transition != "maintainer>builder":
+            lib.die("--chore is for the maintainer handing the builder a chore")
+        if lib.state_get("cycle_base"):
+            lib.die("a cycle is open; finish it before starting a chore")
+    in_chore = lib.state_get("chore")
+    if in_chore and transition == "reviewer>tester" and review:
+        lib.die("chore cycle: findings go back to the builder")
+
+    # The gate for this transition (see 'bus help handoff' for the rules).
+    if ME == "maintainer":
+        report.append("maintainer override: no gates\n")
+        if chore:
+            kind = "chore"
+            report.append("CHORE cycle opened: no red tests, no prover; green and the panel still apply\n")
+    elif transition == "proxy>maintainer":
+        lib.die("the proxy defers by leaving the turn with the maintainer, not by handing it over")
+    elif ME == "proxy":
+        kind = "proxy-decision"
+        report.append("proxy decision (tentative, see bin/proxy): no gates\n")
+    elif to == "maintainer":
+        kind, reason = "escalation", "escalation"
+    elif transition == "tester>builder":
+        gate("clean")
+        gate("paths", "tester", base)
+        if defensive:
+            gate("defensive", base)
+        else:
+            gate("red", base)
+        if not lib.state_get("cycle_base"):
+            opens = True
+    elif transition in ("builder>reviewer", "builder>tester"):
+        if to == "tester" and seats:
+            lib.die("reviewer seats are configured; hand off to the reviewer")
+        if not lib.state_get("cycle_base"):
+            lib.die("no open cycle: the tester hasn't handed you red tests")
+        gate("clean")
+        gate("paths", "builder", base)
+        gate("green")
+        if in_chore:
+            report.append("  ok    prover: chore cycle, no red tests to prove\n")
+        else:
+            gate("prover", lib.state_get("cycle_base"), *lib.state_get("cycle_tests").split())
+        if to == "tester":
+            closes = True
+    elif transition in ("reviewer>builder", "reviewer>tester"):
+        gate("clean")
+        gate("paths", "reviewer", base)
+        if review:
+            if not (os.path.exists(review) and os.path.getsize(review) > 0):
+                lib.die(f"review file '{review}' is empty or missing")
+            kind, bump = "review", True
+        elif to == "builder":
+            lib.die(f"sending work back to the builder needs --review <file> (try {bus}/reviews/latest/findings.txt)")
+        else:
+            latest = bus / "reviews" / "latest"
+            verdict = lib.read_text(latest / "verdict", "none")
+            panel_head = lib.read_text(latest / "head", "none")
+            if verdict == "pass" and panel_head == head_sha:
+                report.append(f"  ok    panel passed on {head_sha[:10]}\n")
+            elif override:
+                report.append(f"  ok    OVERRIDE (panel: {verdict} on {panel_head[:10]}): {override}\n")
+            else:
+                report.append(
+                    f"  FAIL  latest panel is '{verdict}' on {panel_head[:10]}, HEAD is {head_sha[:10]}: "
+                    f"run 'panel', or --override \"<why>\"\n"
+                )
+                gate_ok = False
+            closes = True
+    else:
+        lib.die(f"no such transition: {ME} -> {to} (see 'bus help handoff' for the turn rules)")
+
+    transcript = "".join(report)
+    sys.stdout.write(transcript)
+    if not gate_ok:
+        print("handoff REFUSED: the gate failed; fix the above and retry")
+        return 1
+    if dry_run:
+        print("dry run: the gates pass, nothing changed")
+        return 0
+
+    with_lock()
+    if lib.state_get("turn") != turn or head() != head_sha:
+        lib.die("the turn or HEAD moved while the gates ran; retry")
+
+    if opens:
+        lib.state_set("cycle_base", base)
+        lib.state_set("cycle_tests", "")
+        lib.state_set("round", "0")
+    if chore:
+        lib.state_set("cycle_base", head_sha)
+        lib.state_set("cycle_tests", "")
+        lib.state_set("round", "0")
+        lib.state_set("chore", "1")
+    if transition == "tester>builder" and not defensive:
+        # Remember the cycle's red tests, for the prover at the builder's handoff.
+        changed = lib.git("diff", "--name-only", "--no-renames", "--diff-filter=AM", base, "HEAD", check=False)
+        tests = set(lib.state_get("cycle_tests").split())
+        tests.update(f for f in lib.split_lines(changed) if lib.is_test_path(f))
+        tests.discard("")
+        lib.state_set("cycle_tests", "".join(f"{t} " for t in sorted(tests)))
+    if bump:
+        rounds, max_rounds = int(lib.state_get("round", "0")) + 1, lib.conf_get("max_rounds", "4")
+        lib.state_set("round", str(rounds))
+        if rounds > int(max_rounds):
+            to, kind, reason = "maintainer", "escalation", "round-limit"
+            last_review = lib.read_text(Path(review), "")
+            note = f"Round limit reached ({rounds} > {max_rounds}). Last review follows.\n\n{last_review}"
+    if closes:
+        lib.state_set("cycle_base", "")
+        lib.state_set("cycle_tests", "")
+        lib.state_set("round", "0")
+        # A passed chore goes back to whoever asked for it, as finished work.
+        if in_chore:
+            lib.state_set("chore", "")
+            to, kind, reason = "maintainer", "chore-done", "done"
+    set_turn(to, reason)
+
+    commits = lib.git("log", "--oneline", f"{base}..{head_sha}", quiet=True, check=False)
+    commits = "\n".join(f"  {line}" for line in lib.split_lines(commits))
+    body = (
+        f"{note or '(no note)'}\n\nCommits this turn: {base[:10]}..{head_sha[:10]}\n{commits}\n\n"
+        f"Gate:\n{transcript.rstrip(chr(10))}"
+    ).rstrip("\n")
+    if kind == "review" and to != "maintainer":
+        body += f"\n\nReview ({review}):\n{lib.read_text(Path(review), '')}"
+    if kind == "chore":
+        body = (
+            "CHORE turn: no tests to write. Do the chore, keep the build, suite and checks green, "
+            f"commit, then 'bus handoff reviewer'.\n\n{body}"
+        )
+    if defensive:
+        body = f"DEFENSIVE tests (they already pass): {defensive}\n\n{body}"
+    deliver(to, kind, body)
+    if override:
+        deliver("maintainer", "override", f"reviewer passed {head_sha[:10]} over the panel: {override}")
+    print(f"turn passed to {to}")
+    return 0
+
+
+# ---- help -------------------------------------------------------------------
+
+COMMANDS = [
+    Command(
+        "send",
+        "<to> [-k kind] [text | -]",
+        "drop a message in <to>'s inbox (doesn't pass the turn)",
+        """
+        Talk without passing the turn: questions, heads-ups, evidence. <to> is one of
+        tester, builder, reviewer, maintainer. The text is the remaining arguments
+        joined by spaces, or stdin when the text is a single '-'. -k sets the message
+        kind (default 'message'); it must come right after <to>.
+
+        The message lands in <to>'s unread inbox, stamped with your role, the time and
+        the short HEAD, and the recipient's tmux window gets a one-line
+        "[bus] message from <you>: run 'bus read'" typed into it, so an idle agent
+        wakes up (the maintainer isn't nudged; they read with 'sbx inbox').
+
+        examples:
+          bus send tester "test/Vault.t.sol:88 expects 99 shares, the spec says 100"
+          git diff HEAD~1 | bus send reviewer -k evidence -
+        """,
+        cmd_send,
+    ),
+    Command(
+        "read",
+        "",
+        "print your unread messages and mark them read",
+        """
+        Prints each unread message (=== <id>, then its header and body), oldest first,
+        and moves it to your read inbox. Ends with whose turn it is. Run it at the
+        start of every turn.
+        """,
+        cmd_read,
+    ),
+    Command(
+        "wait",
+        "[seconds]",
+        "block until you have unread mail (exit 1 on timeout)",
+        """
+        Polls your inbox every 3 seconds, up to [seconds] (default 540). Exits 0 with
+        "you have mail: run 'bus read'" as soon as something arrives, or 1 after the
+        timeout, saying whose turn it is. Run it with a 10-minute Bash timeout, and
+        repeat it while it times out, when it isn't your turn.
+        """,
+        cmd_wait,
+    ),
+    Command(
+        "handoff",
+        "<to> [opts] [text | -]",
+        "pass the turn; runs the gate for this transition first",
+        """
+        Runs the gate for <your role> -> <to>, prints the gate's transcript, and only
+        if every check passes, gives <to> the turn. The note (remaining arguments, or
+        stdin for '-') is sent to <to> with the commits of your turn and the gate
+        transcript. If the gate fails: "handoff REFUSED", nothing changes; fix the
+        cause and retry. Options come right after <to>:
+
+          --defensive "<why>"   tester: tests that already pass (defensive coverage), no red needed
+          --review <file>       reviewer: send findings back (to builder or tester); counts a round
+          --override "<why>"    reviewer: pass despite a non-passing panel (logged to the maintainer)
+          --chore               maintainer -> builder: work with no tests to write (docs, config...)
+          --dry-run             run the gates, change nothing
+
+        Turns: tester -> builder -> reviewer -> tester (next slice) ...
+          tester  -> builder   gate: clean, paths(tester), red (or defensive)
+          builder -> reviewer  gate: clean, paths(builder), green, prover
+          builder -> tester    same, only when the project configures no reviewer seats
+          reviewer-> builder|tester --review   gate: clean, paths(reviewer); round += 1
+          reviewer-> tester    (pass) gate: latest panel passed on this exact HEAD, or --override
+          anyone  -> maintainer   always: an escalation (past max_rounds the bus escalates itself)
+          maintainer -> anyone    always (the human overrides)
+          maintainer -> builder --chore   opens a chore cycle: builder -> reviewer needs clean,
+                               paths(builder), green (no red, no prover); the reviewer's pass
+                               returns the turn to the maintainer; findings go back to the builder
+          proxy   -> tester|builder|reviewer   only while an escalation holds the turn (see proxy)
+
+        A cycle opens with the tester's first red handoff and closes with the reviewer's
+        pass. The bus remembers the cycle's red test files and checks them with the
+        prover at the builder's handoff. Each --review counts a round; past the config's
+        max_rounds (default 4) the handoff goes to the maintainer instead, as a
+        round-limit escalation carrying the last review.
+
+        examples:
+          bus handoff builder --dry-run
+          bus handoff builder "slice 2: withdraw rounding; test/Vault.t.sol fails on rounding"
+          bus handoff tester --review reviews/latest/findings.txt "two missing edge cases"
+        """,
+        cmd_handoff,
+    ),
+    Command(
+        "escalate",
+        "[text | -]",
+        "give the turn to the maintainer (blocked, ambiguous spec...)",
+        """
+        Anyone may escalate at any time, without a gate: the turn goes to the
+        maintainer, with your note as an 'escalation' message in their inbox. If the
+        project turns the proxy on, it may answer in the maintainer's place after a
+        grace period.
+        """,
+        cmd_escalate,
+    ),
+    Command(
+        "done",
+        "[text | -]",
+        "tester: the spec is covered; maintainer: release the task",
+        """
+        tester:      the spec is fully covered. Only on your turn. The turn rests with
+                     the maintainer, with your summary as a 'done' message; the task is
+                     then finished (sbx merge accepts it).
+        maintainer:  release the task as done, at any point. If an agent held the turn
+                     it's told to stop (a 'released' message). An open cycle is kept, so
+                     handing the turn back later resumes where it stopped.
+        """,
+        cmd_done,
+    ),
+    Command(
+        "status",
+        "",
+        "whose turn, since when and why, round, bases, unread counts",
+        """
+        Prints the task, whose turn it is (how long ago and why it changed), the turn's
+        base commit, the open cycle's base and round (out of max_rounds), the cycle's
+        red test files (and whether it's a chore cycle), the proxy's setting and budget,
+        each role's unread count, and the last panel's verdict and HEAD.
+        """,
+        cmd_status,
+    ),
+    Command(
+        "log",
+        "",
+        "the task's event log",
+        """
+        Every message, handoff, panel verdict and release, one timestamped line each.
+        """,
+        cmd_log,
+    ),
+    Command(
+        "init",
+        "",
+        "start the task (turn = tester); no-op if already started",
+        """
+        Records the start: the tester holds the turn, round 0. 'sbx agent --role' runs
+        it for you; running it again changes nothing.
+        """,
+        cmd_init,
+    ),
+]
+
+CLI(
+    "bus",
+    """
+Message bus and turn-taking for one task's agents (tester, builder, reviewer)
+plus the maintainer. Only the role holding the turn changes files; 'bus handoff'
+passes the turn, and only through the gate for that transition.
+
+Who you are comes from SBX_ROLE (and SBX_TASK); sbx agent sets both.
+Turns: tester -> builder -> reviewer -> tester (next slice) ... ('bus help handoff'
+has every transition and its gate).
+""",
+    COMMANDS,
+    footer="Set SBX_BUS_NUDGE=0 to deliver messages without typing a wake-up line into the recipient's window.",
+    default="overview-2",
+).run()
