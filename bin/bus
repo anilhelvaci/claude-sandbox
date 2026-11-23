@@ -417,7 +417,7 @@ def cmd_handoff(args: list[str]) -> int:
         # Remember the cycle's red tests, for the prover at the builder's handoff.
         changed = lib.git("diff", "--name-only", "--no-renames", "--diff-filter=AM", base, "HEAD", check=False)
         tests = set(lib.state_get("cycle_tests").split())
-        tests.update(f for f in lib.split_lines(changed) if lib.is_test_path(f))
+        tests.update(f for f in lib.split_lines(changed) if lib.is_runnable_test(f))
         tests.discard("")
         lib.state_set("cycle_tests", "".join(f"{t} " for t in sorted(tests)))
     if bump:

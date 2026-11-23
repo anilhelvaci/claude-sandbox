@@ -312,6 +312,7 @@ setups.
 | `protected` | Paths no agent may change |
 | `scratch` | Paths the gate ignores (agent notes, reports) |
 | `build`, `test`, `check` | `gate green`: build (optional), the full suite (required), then each `check` |
+| `test_files` | Optional: which test paths are runnable test files, e.g. `test_*.py */test_*.py`. Only these go to `test_only`; fixtures and helpers under `test_paths` don't. Unset: every test path is runnable |
 | `test_only` | Runs only the given test files; must contain `{file}` (each file on its own) or `{files}` (all together) |
 | `seats` | Juror seats from `roles/jurors/`, or `none` for no reviewer (default: all four) |
 | `seat_model`, `seat_timeout` | Model and timeout in seconds (default 900) for each seat |

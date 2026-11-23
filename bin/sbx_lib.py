@@ -191,7 +191,23 @@ def matches_any(path: str, key: str) -> bool:
 
 
 def is_test_path(path: str) -> bool:
+    """A path the tester owns (config 'test_paths'): tests, fixtures, test helpers."""
     return matches_any(path, "test_paths")
+
+
+def is_runnable_test(path: str) -> bool:
+    """A test path that 'test_only' can run (config 'test_files').
+
+    Test paths also hold fixtures and helpers, possibly in another stack (a
+    Solidity fixture under a Python project's tests). Only the files matching
+    'test_files' are handed to 'test_only'; with no 'test_files' set, every test
+    path is.
+    """
+    if not is_test_path(path):
+        return False
+    if not any(v.strip() for v in conf_all("test_files")):
+        return True
+    return matches_any(path, "test_files")
 
 
 def is_protected(path: str) -> bool:

@@ -9,6 +9,11 @@ stack = solidity
 test_paths = test/
 test_paths = *.t.sol
 
+# Optional: which test paths are runnable test files. Only these go to 'test_only'
+# (gate red / defensive / prover); fixtures and helpers under test_paths don't.
+# Same pattern rules as test_paths; unset = every test path is runnable.
+# test_files = *.t.sol
+
 # Paths no agent may change (the gate refuses any turn that touches them).
 protected = foundry.toml
 protected = remappings.txt
@@ -53,5 +58,5 @@ skills.reviewer = solidity-auditor
 # Other stacks, for reference:
 #   TypeScript: test_paths = *.test.ts / build = npm run build / test = npm test
 #               check = npm run lint / test_only = npx vitest run {files}
-#   Python:     test_paths = tests/ / test = pytest / check = ruff check .
-#               test_only = pytest {files}
+#   Python:     test_paths = tests/ / test_files = test_*.py */test_*.py
+#               test = pytest / check = ruff check . / test_only = pytest {files}
