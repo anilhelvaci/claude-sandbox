@@ -49,6 +49,11 @@ seats = prover saboteur breaker corner-prober
 seat_timeout = 900
 max_rounds = 4
 
+# Gate plugins: extra tools 'gate green' runs on each cycle's diff. Managed by
+# 'sbx plugins <name> add <url>' (it writes these lines); 'plugin.<name> = off' disables one.
+# plugin = crap4sol https://github.com/anilhelvaci/crap4sol@<sha>
+# plugin.crap4sol = block
+
 # Specialization: skills (by directory name) each role is told to use. Install them
 # into this sandbox with: sbx skills <name> add <skill>...
 skills.tester = x-ray fizz

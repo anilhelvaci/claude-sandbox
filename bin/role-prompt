@@ -69,6 +69,28 @@ def main() -> int:
                     "they add it with sbx skills.\n"
                 )
 
+    # Layer 2b: gate plugins (tools 'gate green' runs on the cycle's diff).
+    plugins = lib.plugins_enabled()
+    if plugins and role in ("builder", "reviewer"):
+        out.write(
+            "\n## Gate plugins\n\n'gate green' also runs these tools on the open cycle's diff; each one can "
+            "block the builder's handoff. 'finding' means the code must change; 'tool error' means the tool "
+            "itself failed (retry, then escalate). Their briefs, from the tools' authors:\n"
+        )
+        for name in plugins:
+            manifest = lib.plugin_manifest(name)
+            if manifest is None:
+                out.write(f"\n### {name}\n\nNOT INSTALLED: its gate fails until the maintainer installs it.\n")
+                continue
+            exits = ", ".join(f"exit {k[5:]} = {v[0]}" for k, v in sorted(manifest.items()) if k.startswith("exit."))
+            out.write(f"\n### {name}\n\nRuns: `{(manifest.get('run') or ['?'])[0]}`" + (f" ({exits})" if exits else ""))
+            brief_rel = (manifest.get("brief") or [""])[0]
+            brief_file = lib.SBX_PLUGINS / name / "src" / brief_rel if brief_rel else None
+            if brief_file and brief_file.is_file():
+                out.write("\n\n" + brief_file.read_text().strip() + "\n")
+            else:
+                out.write("\n")
+
     # Layer 3: the project's notes for the role, and the gate config.
     notes = lib.SBX_PROJECT / f"{role}.md"
     if notes.is_file():

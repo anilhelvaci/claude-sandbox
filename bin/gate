@@ -8,6 +8,7 @@ agents run them by hand to check their work early. Exit 0 = pass.
 
 from __future__ import annotations
 
+import os
 import shlex
 import subprocess
 from pathlib import Path
@@ -170,7 +171,62 @@ def cmd_green(args: list[str]) -> int:
     for check in lib.conf_all("check"):
         if check:
             ok = run_step("check", check) and ok
+    for name in lib.plugins_enabled():
+        ok = run_plugin(name) and ok
     return 0 if ok else 1
+
+
+def plugin_base() -> str:
+    """What a plugin judges: the open cycle's diff (what the panel reviews), else the turn's."""
+    return lib.state_get("cycle_base") or turn_base()
+
+
+def run_plugin(name: str) -> bool:
+    """Run one gate plugin's 'run' line. Exit 0 passes; the manifest's exit.<code>
+    says whether another code is a 'finding' (the code's fault) or an 'error' (the
+    tool's); both fail the gate. Unmapped codes are errors."""
+    manifest = lib.plugin_manifest(name)
+    if manifest is None:
+        print(f"  FAIL  plugin {name}: not installed (on the host: sbx plugins <sandbox> add <its source>)")
+        return False
+    run = (manifest.get("run") or [""])[0]
+    if not run:
+        print(f"  FAIL  plugin {name}: its {lib.PLUGIN_MANIFEST} has no 'run'")
+        return False
+    base = plugin_base()
+    changed = lib.git("diff", "--name-only", "--no-renames", "--diff-filter=AM", base, "HEAD")
+    prefix = lib.SBX_PLUGINS / name
+    state = lib.plugin_state(name)
+    state.mkdir(parents=True, exist_ok=True)
+    cmd = (
+        run.replace("{base}", shlex.quote(base))
+        .replace("{changed}", " ".join(shlex.quote(f) for f in lib.split_lines(changed)))
+        .replace("{prefix}", shlex.quote(str(prefix)))
+        .replace("{state}", shlex.quote(str(state)))
+    )
+    env = {
+        **os.environ,
+        "PATH": f"{prefix / 'bin'}:{os.environ.get('PATH', '')}",
+        "SBX_PLUGIN_PREFIX": str(prefix),
+        "SBX_PLUGIN_STATE": str(state),
+        "SBX_BASE": base,
+    }
+    log = log_dir() / f"{lib.stamp()}-plugin-{name}.log"
+    with open(log, "w") as out:
+        rc = subprocess.run(["bash", "-c", cmd], stdout=out, stderr=subprocess.STDOUT, env=env).returncode
+    if rc == 0:
+        print(f"  ok    plugin {name}: {cmd}")
+        return True
+    meaning = (manifest.get(f"exit.{rc}") or ["error"])[0]
+    if meaning == "finding":
+        print(f"  FAIL  plugin {name}: finding (exit {rc}): {cmd}  (log: {log})")
+    else:
+        print(
+            f"  FAIL  plugin {name}: tool error (exit {rc}), not necessarily your code; "
+            f"escalate if it persists: {cmd}  (log: {log})"
+        )
+    indented_tail(log, 30)
+    return False
 
 
 def cmd_prover(args: list[str]) -> int:
@@ -284,11 +340,17 @@ COMMANDS = [
     Command(
         "green",
         "",
-        "build, full test suite and every 'check' pass",
+        "build, full test suite, every 'check' and every gate plugin pass",
         """
         Runs, from the config, 'build' (if set), then 'test' (required), then every
-        'check' line, each logged separately. All of them run even after a failure,
-        so you see every problem at once. A failure prints the last 20 lines of its log.
+        'check' line, then every enabled gate plugin ('plugin' lines), each logged
+        separately. All of them run even after a failure, so you see every problem at
+        once. A failure prints the tail of its log.
+
+        A plugin judges the open cycle's diff (the panel's base; else the turn's):
+        its 'run' line gets {base} and {changed} (files added or modified since then).
+        Its failure says 'finding' (fix the code) or 'tool error' (the tool itself
+        failed: retry, then escalate). Your role prompt lists each plugin's brief.
         """,
         cmd_green,
     ),
