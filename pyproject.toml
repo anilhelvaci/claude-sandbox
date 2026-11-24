@@ -10,6 +10,7 @@ line-length = 120
 extend-include = [
     "sbx",
     "init-firewall",
+    "bin/atlas",
     "bin/bus",
     "bin/gate",
     "bin/panel",
@@ -38,4 +39,4 @@ extraPaths = ["bin"]
 typeCheckingMode = "standard"
 
 [tool.ruff.lint.isort]
-known-first-party = ["sbx_lib", "sbx_cli"]
+known-first-party = ["sbx_lib", "sbx_cli", "atlas_render"]

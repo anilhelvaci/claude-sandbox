@@ -1,0 +1,398 @@
+#!/usr/bin/env python3
+"""atlas: a deterministic picture of what a cycle changed (API, borders, dependencies,
+impacted modules, sequence diagrams of tests), for the maintainer.
+
+The bus starts 'atlas build' in the background when a cycle closes; nobody waits
+for it. Output goes to <bus>/views/ and 'sbx view <name> <task>' shows it on the Mac.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import fnmatch
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import traceback
+from pathlib import Path
+
+import atlas_render as render
+import sbx_lib as lib
+from sbx_cli import CLI, Command
+
+HERE = Path(__file__).resolve().parent
+BUS = str(HERE / "bus")
+# One extractor per stack. Each runs under its own interpreter and implements
+# 'model <root> <out>' and 'traces <root> <model> <wanted> <out>'.
+EXTRACTORS = {
+    "solidity": {"script": HERE / "atlas_solidity.py", "python": "~/.venvs/slither/bin/python"},
+}
+EXTERNAL_DEFAULT = "lib/ node_modules/"
+SCRIPT_DEFAULT = "script/"
+
+
+def views_dir() -> Path:
+    d = lib.bus_dir() / "views"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def write_json(path: Path, data) -> None:
+    tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(data, indent=1, sort_keys=True))
+    os.replace(tmp, path)
+
+
+def read_json(path: Path, default):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return default
+
+
+class Manifest:
+    """<views>/manifest.json: every cycle's view, oldest first. Updated under a lock."""
+
+    def __init__(self) -> None:
+        self.path = views_dir() / "manifest.json"
+        self.lock_path = views_dir() / "lock"
+
+    def update(self, fn):
+        with open(self.lock_path, "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            data = read_json(self.path, {"task": lib.task_name(), "cycles": []})
+            result = fn(data)
+            data["updated_at"] = lib.now()
+            write_json(self.path, data)
+            return result
+
+
+def resolve(rev: str) -> str:
+    return lib.git("rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}", quiet=True, check=False)
+
+
+def task_base_default(cycle_base: str) -> str:
+    """state task_base (bus init records it); else the commit 'bus init' logged; else the cycle base."""
+    base = lib.state_get("task_base")
+    if base and resolve(base):
+        return resolve(base)
+    log = lib.read_text(lib.bus_dir() / "log")
+    for line in lib.split_lines(log):
+        if "init: task started at " in line:
+            sha = resolve(line.rsplit(" at ", 1)[1].split(",")[0].strip())
+            if sha:
+                return sha
+    return cycle_base
+
+
+# ---- path roles -------------------------------------------------------------
+
+
+def patterns(key: str, default: str) -> list[str]:
+    values = lib.conf_all(key) or [default]
+    return [p for v in values for p in v.split()]
+
+
+def path_matches(path: str, pats: list[str]) -> bool:
+    for p in pats:
+        if p.endswith("/"):
+            if path.startswith(p):
+                return True
+        elif fnmatch.fnmatchcase(path, p):
+            return True
+    return False
+
+
+def role_of(path: str) -> str:
+    if path.startswith("..") or os.path.isabs(path) or path_matches(path, patterns("atlas_external", EXTERNAL_DEFAULT)):
+        return "external"
+    if lib.is_test_path(path):
+        return "test"
+    if path_matches(path, patterns("atlas_scripts", SCRIPT_DEFAULT)):
+        return "script"
+    return "src"
+
+
+def annotate(model: dict) -> dict:
+    for m in model.get("modules", {}).values():
+        m["role"] = role_of(m["path"])
+    return model
+
+
+# ---- snapshots and extraction -----------------------------------------------
+
+
+def snapshot(sha: str, top: str) -> str:
+    """Export <sha> into a container-local temp dir (git archive: no worktree to
+    register or leave behind). Submodules and node_modules aren't in the archive;
+    they're symlinked from the agent's worktree (the firewall blocks fetching them)."""
+    tmp = tempfile.mkdtemp(prefix=f"atlas-{sha[:10]}-")
+    archive = subprocess.Popen(["git", "-C", top, "archive", "--format=tar", sha], stdout=subprocess.PIPE)
+    rc = subprocess.run(["tar", "-x", "-C", tmp], stdin=archive.stdout).returncode
+    if archive.wait() != 0 or rc != 0:
+        raise RuntimeError(f"git archive {sha[:10]} failed")
+    tree = lib.git("-C", top, "ls-tree", "-r", "-z", sha, quiet=True, check=False)
+    links = [e.split("\t", 1)[1] for e in tree.split("\0") if e.startswith("160000 ")]
+    if os.path.isdir(os.path.join(top, "node_modules")):
+        links.append("node_modules")
+    for rel in links:
+        src, dst = os.path.join(top, rel), os.path.join(tmp, rel)
+        if not os.path.exists(src):
+            continue
+        if os.path.isdir(dst) and not os.listdir(dst):
+            os.rmdir(dst)
+        if not os.path.exists(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst)
+    return tmp
+
+
+class Extractor:
+    def __init__(self, stack: str) -> None:
+        spec = EXTRACTORS[stack]
+        self.script = str(spec["script"])
+        self.python = os.path.expanduser(lib.conf_get("atlas_python", str(spec["python"])))
+        if not os.path.exists(self.python):
+            raise RuntimeError(f"{self.python} not found (set atlas_python in the project config)")
+        self.timeout = int(lib.conf_get("atlas_timeout", "1800"))
+
+    def run(self, *args: str) -> None:
+        proc = subprocess.run(
+            [self.python, "-I", self.script, *args],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=self.timeout,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(f"extractor {args[0]} failed:\n{proc.stdout[-3000:]}")
+
+
+def model_for(sha: str, top: str, ex: Extractor, cache: Path, keep: dict[str, str]) -> dict:
+    """The model at <sha>, from the cache when possible. keep[sha] holds the snapshot dir if one was made."""
+    cached = cache / f"{sha}.json"
+    if not cached.exists():
+        keep[sha] = keep.get(sha) or snapshot(sha, top)
+        ex.run("model", keep[sha], str(cached))
+    return annotate(read_json(cached, {"modules": {}, "edges": []}))
+
+
+# ---- which tests get a sequence diagram -------------------------------------
+
+
+def tests_of(model: dict) -> dict[str, set[tuple[str, str]]]:
+    """path -> {("<Contract>.<test>", body hash)} for runnable test files. A test is
+    listed under the contract that declares it (inherited copies aren't redrawn)."""
+    out: dict[str, set[tuple[str, str]]] = {}
+    for cname, m in model.get("modules", {}).items():
+        if m.get("role") != "test" or m.get("abstract") or not lib.is_runnable_test(m["path"]):
+            continue
+        for s in m["symbols"].values():
+            if s["kind"] == "function" and s["name"].startswith("test") and s["visibility"] in ("public", "external"):
+                out.setdefault(m["path"], set()).add((f"{cname.split('@')[0]}.{s['name']}", s.get("hash", "")))
+    return out
+
+
+def pick_tests(head: dict, cycle_base: dict, cycle_files: list[str]) -> tuple[dict[str, list[str]], dict[str, str]]:
+    """New or changed tests this cycle (in the cycle's red test files, if known), then
+    the configured 'scenarios', up to atlas_max_traces. Returns ({path: ["C.test"]},
+    {"<path>:C.test": "new" | "scenario"})."""
+    limit = int(lib.conf_get("atlas_max_traces", "10"))
+    now, before = tests_of(head), tests_of(cycle_base)
+    scen = patterns("scenarios", "")
+    picked: dict[str, str] = {}
+    for path in sorted(now):
+        if cycle_files and path not in cycle_files:
+            continue
+        for test, h in sorted(now[path]):
+            if (test, h) not in before.get(path, set()):
+                picked.setdefault(f"{path}:{test}", "new")
+    for path in sorted(now):
+        if scen and path_matches(path, scen):
+            for test, _ in sorted(now[path]):
+                picked.setdefault(f"{path}:{test}", "scenario")
+    reasons = dict(list(picked.items())[:limit])
+    wanted: dict[str, list[str]] = {}
+    for key in reasons:
+        path, test = key.rsplit(":", 1)
+        wanted.setdefault(path, []).append(test)
+    return wanted, reasons
+
+
+# ---- build ------------------------------------------------------------------
+
+
+def notify_breaking(entry: dict, view: dict) -> None:
+    rows = [r for r in view["diffs"]["cycle"]["api"] if r["breaking"]]
+    if not rows:
+        return
+    lines = [f"cycle {entry['id']}: {len(rows)} breaking API change(s); 'sbx view' shows the rest"]
+    lines += [f"  {r['module']}: {r['change']} {r['kind']} {r['signature']} {r['detail']}".rstrip() for r in rows[:20]]
+    env = {**os.environ, "SBX_ROLE": "atlas", "SBX_BUS_NUDGE": "0"}
+    subprocess.run(
+        [BUS, "send", "maintainer", "-k", "api-break", "-"],
+        input="\n".join(lines),
+        text=True,
+        env=env,
+        stdout=subprocess.DEVNULL,
+        check=False,
+    )
+
+
+def cmd_build(args: list[str]) -> int:
+    opts = {"--head": "", "--cycle-base": "", "--task-base": "", "--tests": ""}
+    while args:
+        if args[0] in opts and len(args) >= 2:
+            opts[args[0]], args = args[1], args[2:]
+        else:
+            lib.die(f"unknown argument '{args[0]}' (see 'atlas help build')")
+    if lib.conf_get("atlas", "on") == "off":
+        print("atlas: off in the project config")
+        return 0
+    stack = lib.conf_get("stack", "")
+    if stack not in EXTRACTORS:
+        print(f"atlas: no extractor for stack '{stack or '(unset)'}' (have: {', '.join(EXTRACTORS)})")
+        lib.log_event(f"atlas: skipped, no extractor for stack '{stack}'")
+        return 0
+    top = lib.git("rev-parse", "--show-toplevel")
+    head = resolve(opts["--head"] or "HEAD")
+    cycle_base = resolve(opts["--cycle-base"] or lib.state_get("cycle_base") or lib.state_get("turn_base") or head)
+    task_base = resolve(opts["--task-base"]) if opts["--task-base"] else task_base_default(cycle_base)
+    if not (head and cycle_base and task_base):
+        lib.die("can't resolve head / cycle base / task base")
+    cycle_files = opts["--tests"].split()
+
+    manifest = Manifest()
+
+    def reserve(data):
+        n = len(data["cycles"]) + 1
+        entry = {
+            "id": f"{n:03d}-{head[:10]}",
+            "n": n,
+            "head": head,
+            "cycle_base": cycle_base,
+            "task_base": task_base,
+            "started_at": lib.now(),
+            "status": "running",
+        }
+        data["cycles"].append(entry)
+        return entry
+
+    entry = manifest.update(reserve)
+    out = views_dir() / entry["id"]
+    out.mkdir(exist_ok=True)
+    started = time.time()
+    keep: dict[str, str] = {}
+    print(f"atlas: building view {entry['id']} ({cycle_base[:10]}..{head[:10]}, task from {task_base[:10]})")
+    try:
+        ex = Extractor(stack)
+        cache = views_dir() / "cache"
+        cache.mkdir(exist_ok=True)
+        m_head = model_for(head, top, ex, cache, keep)
+        m_cycle = model_for(cycle_base, top, ex, cache, keep)
+        m_task = model_for(task_base, top, ex, cache, keep)
+        wanted, reasons = pick_tests(m_head, m_cycle, cycle_files)
+        traces: list[dict] = []
+        if wanted:
+            keep[head] = keep.get(head) or snapshot(head, top)
+            write_json(out / "wanted.json", wanted)
+            ex.run(
+                "traces", keep[head], str(cache / f"{head}.json"), str(out / "wanted.json"), str(out / "traces.json")
+            )
+            traces = read_json(out / "traces.json", [])
+        meta = {
+            "id": entry["id"],
+            "head": head,
+            "cycle_base": cycle_base,
+            "task_base": task_base,
+            "stack": stack,
+            "generated_at": lib.now(),
+            "trace_reasons": reasons,
+        }
+        view = render.render_view(m_head, m_cycle, m_task, traces, meta)
+        write_json(out / "view.json", view)
+        summary = {
+            "cycle": view["diffs"]["cycle"]["summary"],
+            "task": view["diffs"]["task"]["summary"],
+            "sequences": len(view["sequences"]),
+        }
+        status, error = "ok", ""
+    except Exception as e:  # never let a picture break anything; record why
+        status, error, summary, view = "error", f"{e}\n{traceback.format_exc()[-2000:]}", {}, None
+    finally:
+        for d in keep.values():
+            shutil.rmtree(d, ignore_errors=True)
+
+    def finish(data):
+        for c in data["cycles"]:
+            if c["id"] == entry["id"]:
+                c.update(
+                    status=status,
+                    error=error,
+                    summary=summary,
+                    finished_at=lib.now(),
+                    seconds=int(time.time() - started),
+                )
+                return c
+        return entry
+
+    done = manifest.update(finish)
+    lib.log_event(f"atlas: view {entry['id']} {status} ({done.get('seconds', '?')}s)")
+    print(f"atlas: {status} in {done.get('seconds', '?')}s: {out}")
+    if status == "ok" and view is not None:
+        notify_breaking(entry, view)
+        return 0
+    print(error, file=sys.stderr)
+    return 1
+
+
+def cmd_list(args: list[str]) -> int:
+    data = read_json(views_dir() / "manifest.json", {"cycles": []})
+    if not data["cycles"]:
+        print("(no views yet)")
+    for c in data["cycles"]:
+        s = c.get("summary", {}).get("cycle", {})
+        print(
+            f"{c['id']}  {c['status']:<8} {c.get('finished_at', c['started_at'])}  "
+            f"api {s.get('api_changes', '-')} (breaking {s.get('breaking', '-')})  "
+            f"modules {s.get('modules_touched', '-')}"
+        )
+    return 0
+
+
+COMMANDS = [
+    Command(
+        "build",
+        '[--head S] [--cycle-base S] [--task-base S] [--tests "files"]',
+        "extract, diff and render one cycle's view into <bus>/views/",
+        """
+        Snapshots each commit with 'git archive' (container-local temp dir; the agents'
+        worktree is never touched), extracts a model per commit with the stack's
+        extractor (stack = solidity: Slither for structure and ABI, forge test traces for
+        sequence diagrams; models are cached per commit), diffs head against the cycle
+        base and the task base, and renders:
+
+          external API changes   functions, events, errors, storage layout (breaking flagged)
+          module borders         src contracts grouped by directory, packages collapsed
+          dependency diff        touched contracts + neighbors, edges colored by change
+          impacted contracts     class diagram, methods marked NEW / CHANGED / REMOVED
+          sequence diagrams      new/changed tests this cycle, then the 'scenarios' tests
+
+        Defaults: head = HEAD; cycle base = the open cycle's (or the turn's) base; task
+        base = recorded by 'bus init'. --tests limits "new tests" to those files (the bus
+        passes the cycle's red test files). The bus runs this in the background when a
+        cycle closes; a breaking API change also lands in the maintainer's inbox.
+        Config: atlas (on|off), atlas_python, atlas_max_traces, atlas_timeout,
+        scenarios, atlas_external, atlas_scripts.
+        """,
+        cmd_build,
+    ),
+    Command("list", "", "the task's views: id, status, change counts", "One line per built view.", cmd_list),
+]
+
+if __name__ == "__main__":
+    CLI("atlas", __doc__ or "", COMMANDS, default="overview-2").run()

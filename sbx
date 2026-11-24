@@ -408,6 +408,50 @@ def cmd_inbox(args: list[str]) -> int:
     return 0
 
 
+def cmd_view(args: list[str]) -> int:
+    """Serve one task's atlas views (<clone>/.git/sbx/<task>/views/) on localhost."""
+    import http.server
+    import webbrowser
+
+    name = need_name(args)
+    rest = [a for a in args[1:] if a != "--no-open"]
+    bus_root = repo_dir(name) / ".git" / "sbx"
+    if rest:
+        task = rest[0]
+    else:
+        tasks = sorted(d.name for d in bus_root.glob("*") if (d / "views" / "manifest.json").is_file())
+        if len(tasks) != 1:
+            die(f"usage: sbx view <name> <task> (tasks with views: {', '.join(tasks) or 'none'})")
+        task = tasks[0]
+    views = bus_root / task / "views"
+    if not (views / "manifest.json").is_file():
+        die(f"no views for task '{task}' yet: a cycle has to close first (or run 'atlas build' in its worktree)")
+    shutil.copy(HERE / "templates" / "atlas" / "index.html", views / "index.html")
+
+    class Handler(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, directory=str(views), **kw)
+
+        def end_headers(self):
+            self.send_header("Cache-Control", "no-store")
+            super().end_headers()
+
+        def log_message(self, format, *a):  # quiet: the page polls every 5s
+            pass
+
+    port = int(os.environ.get("SBX_VIEW_PORT") or "0")
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    url = f"http://127.0.0.1:{server.server_address[1]}/"
+    print(f"atlas for {name}/{task}: {url}  (follows new cycles; Ctrl-C to stop)", flush=True)
+    if "--no-open" not in args:
+        webbrowser.open(url)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print()
+    return 0
+
+
 def cmd_merge(args: list[str]) -> int:
     """Bring a finished task's work into the repo the sandbox was cloned from.
 
@@ -852,6 +896,20 @@ COMMANDS = [
           sbx skills proto add x-ray fizz solidity-auditor
         """,
         cmd_skills,
+    ),
+    Command(
+        "view",
+        "<name> [task] [--no-open]",
+        "open the task's atlas: API changes, borders, dependency diff, sequence diagrams",
+        """
+        Serves the task's views (<clone>/.git/sbx/<task>/views/, written by 'atlas build'
+        each time a cycle closes) on 127.0.0.1 and opens it in your browser. One page
+        per task: it follows new cycles as they land (untick "follow latest" or click a
+        cycle to pin one) and switches between this cycle's diff and the whole task's.
+        [task] can be left out when only one task has views. SBX_VIEW_PORT fixes the port.
+        Read-only: nothing here waits for you or changes the fleet's work.
+        """,
+        cmd_view,
     ),
     Command(
         "merge",

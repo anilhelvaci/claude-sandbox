@@ -11,6 +11,7 @@ clone's shared .git (<clone>/.git/sbx/<task>/), with atomic renames:
     log                        the task's event log
     reviews/                   panel runs (reviews/latest -> the newest)
     gate/                      gate logs
+    views/                     atlas pictures of closed cycles (started here, see 'atlas help')
 
 Who you are comes from SBX_ROLE (and SBX_TASK); sbx agent sets both.
 """
@@ -31,6 +32,7 @@ from sbx_cli import CLI, Command
 ME = os.environ.get("SBX_ROLE", "")
 ROLES = ["tester", "builder", "reviewer", "maintainer"]
 GATE = str(Path(__file__).resolve().parent / "gate")
+ATLAS = str(Path(__file__).resolve().parent / "atlas")
 DEFAULT_SEATS = "prover saboteur breaker corner-prober"
 
 _lock_file = None  # held until the process exits
@@ -126,6 +128,7 @@ def cmd_init(args: list[str]) -> int:
     if not lib.state_get("turn"):
         set_turn("tester", "start")
         lib.state_set("round", "0")
+        lib.state_set("task_base", head())  # atlas diffs the whole task against it
         lib.log_event(f"init: task started at {head(short=True)}, turn = tester")
         print(f"task '{lib.task_name()}' started; tester holds the turn")
     return 0
@@ -417,7 +420,7 @@ def cmd_handoff(args: list[str]) -> int:
         # Remember the cycle's red tests, for the prover at the builder's handoff.
         changed = lib.git("diff", "--name-only", "--no-renames", "--diff-filter=AM", base, "HEAD", check=False)
         tests = set(lib.state_get("cycle_tests").split())
-        tests.update(f for f in lib.split_lines(changed) if lib.is_test_path(f))
+        tests.update(f for f in lib.split_lines(changed) if lib.is_runnable_test(f))
         tests.discard("")
         lib.state_set("cycle_tests", "".join(f"{t} " for t in sorted(tests)))
     if bump:
@@ -427,6 +430,7 @@ def cmd_handoff(args: list[str]) -> int:
             to, kind, reason = "maintainer", "escalation", "round-limit"
             last_review = lib.read_text(Path(review), "")
             note = f"Round limit reached ({rounds} > {max_rounds}). Last review follows.\n\n{last_review}"
+    closed_cycle = (lib.state_get("cycle_base"), lib.state_get("cycle_tests")) if closes else None
     if closes:
         lib.state_set("cycle_base", "")
         lib.state_set("cycle_tests", "")
@@ -456,7 +460,32 @@ def cmd_handoff(args: list[str]) -> int:
     if override:
         deliver("maintainer", "override", f"reviewer passed {head_sha[:10]} over the panel: {override}")
     print(f"turn passed to {to}")
+    if closed_cycle:
+        spawn_atlas(closed_cycle[0] or base, head_sha, closed_cycle[1])
     return 0
+
+
+def spawn_atlas(cycle_base: str, head_sha: str, tests: str) -> None:
+    """Draw the closed cycle's picture in the background (see 'atlas help build').
+    Detached and best-effort: the next cycle never waits for it, and a failure
+    to start it is only logged."""
+    if lib.conf_get("atlas", "on") == "off":
+        return
+    views = lib.bus_dir() / "views"
+    try:
+        views.mkdir(parents=True, exist_ok=True)
+        with open(views / "atlas.log", "a") as log:
+            subprocess.Popen(
+                [ATLAS, "build", "--head", head_sha, "--cycle-base", cycle_base, "--tests", tests.strip()],
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,  # survives this command and its caller's process group
+                close_fds=True,  # never inherit the bus lock
+            )
+        print("atlas: drawing this cycle in the background (the maintainer sees it with 'sbx view')")
+    except OSError as e:
+        lib.log_event(f"atlas: not started: {e}")
 
 
 # ---- help -------------------------------------------------------------------

@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fleet atlas</title>
+<style>
+  :root {
+    --bg: #f8fafc; --panel: #ffffff; --ink: #0f172a; --muted: #64748b; --line: #e2e8f0;
+    --accent: #2563eb; --added: #16a34a; --changed: #d97706; --removed: #dc2626; --chip: #f1f5f9;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0b1120; --panel: #111827; --ink: #e5e7eb; --muted: #94a3b8; --line: #1f2937;
+      --accent: #60a5fa; --chip: #1f2937;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0b1120; --panel: #111827; --ink: #e5e7eb; --muted: #94a3b8; --line: #1f2937;
+    --accent: #60a5fa; --chip: #1f2937;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
+  .app { display: grid; grid-template-columns: 260px 1fr; min-height: 100vh; }
+  aside { border-right: 1px solid var(--line); background: var(--panel); padding: 16px; position: sticky;
+          top: 0; height: 100vh; overflow: auto; }
+  aside h1 { font-size: 15px; margin: 0 0 2px; }
+  aside .task { color: var(--muted); margin-bottom: 12px; }
+  .follow { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; color: var(--muted); }
+  .cycles { list-style: none; margin: 0; padding: 0; }
+  .cycles li { padding: 8px 10px; border-radius: 8px; cursor: pointer; margin-bottom: 4px; border: 1px solid transparent; }
+  .cycles li:hover { background: var(--chip); }
+  .cycles li.sel { border-color: var(--accent); background: var(--chip); }
+  .cycles .row1 { display: flex; justify-content: space-between; gap: 6px; }
+  .cycles .when { color: var(--muted); font-size: 12px; }
+  .badge { display: inline-block; padding: 0 7px; border-radius: 999px; font-size: 11.5px; line-height: 18px;
+           background: var(--chip); color: var(--muted); white-space: nowrap; }
+  .badge.break { background: #fee2e2; color: #991b1b; }
+  .badge.run { background: #dbeafe; color: #1e40af; }
+  .badge.err { background: #fee2e2; color: #991b1b; }
+  .badge.new { background: #dcfce7; color: #166534; }
+  main { padding: 20px 24px 60px; min-width: 0; }
+  header.top { display: flex; flex-wrap: wrap; gap: 12px; align-items: baseline; justify-content: space-between; }
+  header.top h2 { margin: 0; font-size: 18px; }
+  .meta { color: var(--muted); }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .seg button { border: 0; background: var(--panel); color: var(--ink); padding: 6px 12px; cursor: pointer; font: inherit; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-top: 16px; }
+  section h3 { margin: 0 0 10px; font-size: 15px; display: flex; gap: 8px; align-items: center; }
+  .empty { color: var(--muted); }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; }
+  td.chg-added { color: var(--added); } td.chg-removed { color: var(--removed); } td.chg-changed { color: var(--changed); }
+  .diagram { overflow-x: auto; padding: 8px 0; }
+  .diagram svg { max-width: none; height: auto; }
+  details.src summary { color: var(--muted); cursor: pointer; font-size: 12px; }
+  details.src pre { background: var(--chip); padding: 10px; border-radius: 8px; overflow: auto; max-height: 320px; }
+  details.seq { border-top: 1px solid var(--line); padding: 8px 0; }
+  details.seq > summary { cursor: pointer; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .legend { display: flex; gap: 12px; flex-wrap: wrap; color: var(--muted); font-size: 12px; }
+  .sw { display: inline-block; width: 12px; height: 12px; border-radius: 3px; vertical-align: -2px; margin-right: 4px; border: 1px solid; }
+  .err-box { white-space: pre-wrap; background: #fee2e2; color: #7f1d1d; padding: 10px; border-radius: 8px; }
+  @media (max-width: 760px) {
+    .app { grid-template-columns: 1fr; }
+    aside { position: static; height: auto; border-right: 0; border-bottom: 1px solid var(--line); }
+    main { padding: 16px; }
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <aside>
+    <h1>Fleet atlas</h1>
+    <div class="task" id="task">loading…</div>
+    <label class="follow"><input type="checkbox" id="follow" checked> follow latest cycle</label>
+    <ul class="cycles" id="cycles"></ul>
+  </aside>
+  <main id="main"><p class="empty">Waiting for the first view…</p></main>
+</div>
+<script type="module">
+import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.esm.min.mjs";
+
+const dark = matchMedia("(prefers-color-scheme: dark)").matches;
+mermaid.initialize({ startOnLoad: false, theme: dark ? "dark" : "default", securityLevel: "strict",
+                     flowchart: { useMaxWidth: false }, sequence: { useMaxWidth: false } });
+
+const state = { manifest: null, sel: null, diff: "cycle", shown: "" };
+const $ = (s) => document.querySelector(s);
+const esc = (t) => String(t ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+function readHash() {
+  const p = new URLSearchParams(location.hash.slice(1));
+  if (p.get("c")) { state.sel = p.get("c"); $("#follow").checked = false; }
+  if (p.get("d")) state.diff = p.get("d");
+}
+function writeHash() {
+  const p = new URLSearchParams();
+  if (!$("#follow").checked && state.sel) p.set("c", state.sel);
+  if (state.diff !== "cycle") p.set("d", state.diff);
+  history.replaceState(null, "", "#" + p.toString());
+}
+
+function ago(iso) {
+  if (!iso) return "";
+  const s = Math.max(0, (Date.now() - Date.parse(iso)) / 1000);
+  if (s < 90) return Math.round(s) + "s ago";
+  if (s < 5400) return Math.round(s / 60) + "m ago";
+  if (s < 129600) return Math.round(s / 3600) + "h ago";
+  return Math.round(s / 86400) + "d ago";
+}
+
+function renderList() {
+  const m = state.manifest;
+  $("#task").textContent = "task " + (m.task || "?") + " · " + m.cycles.length + " cycle(s)";
+  const ul = $("#cycles");
+  ul.innerHTML = "";
+  [...m.cycles].reverse().forEach((c) => {
+    const s = (c.summary || {}).cycle || {};
+    const li = document.createElement("li");
+    li.className = c.id === state.sel ? "sel" : "";
+    let badges = "";
+    if (c.status === "running") badges += '<span class="badge run">building</span> ';
+    else if (c.status === "error") badges += '<span class="badge err">error</span> ';
+    else {
+      if (s.breaking) badges += `<span class="badge break">${s.breaking} breaking</span> `;
+      badges += `<span class="badge">api ${s.api_changes ?? 0}</span> <span class="badge">${s.modules_touched ?? 0} mod</span>`;
+    }
+    li.innerHTML = `<div class="row1"><b>#${c.n}</b><span class="when">${ago(c.finished_at || c.started_at)}</span></div>
+      <div class="mono when">${esc(c.cycle_base.slice(0, 8))}..${esc(c.head.slice(0, 8))}</div><div>${badges}</div>`;
+    li.onclick = () => { $("#follow").checked = false; state.sel = c.id; writeHash(); renderList(); show(); };
+    ul.appendChild(li);
+  });
+}
+
+let seq = 0;
+async function diagram(el, src) {
+  if (!src) { el.innerHTML = '<p class="empty">Nothing to draw.</p>'; return; }
+  const box = document.createElement("div");
+  box.className = "diagram";
+  el.appendChild(box);
+  try {
+    const { svg } = await mermaid.render("m" + (++seq), src);
+    box.innerHTML = svg;
+  } catch (e) {
+    box.innerHTML = `<div class="err-box">Mermaid could not draw this: ${esc(e.message || e)}</div>`;
+  }
+  const d = document.createElement("details");
+  d.className = "src";
+  d.innerHTML = `<summary>mermaid source</summary><pre class="mono">${esc(src)}</pre>`;
+  el.appendChild(d);
+}
+
+function apiTable(rows) {
+  if (!rows.length) return '<p class="empty">No external API changes.</p>';
+  const sorted = [...rows].sort((a, b) => (b.breaking - a.breaking) || a.module.localeCompare(b.module));
+  return `<table><thead><tr><th>contract</th><th>kind</th><th>change</th><th>signature</th><th>detail</th></tr></thead><tbody>
+    ${sorted.map((r) => `<tr><td><b>${esc(r.module)}</b></td><td>${esc(r.kind)}</td>
+      <td class="chg-${esc(r.change)}">${esc(r.change)} ${r.breaking ? '<span class="badge break">breaking</span>' : ""}</td>
+      <td class="mono">${esc(r.signature)}</td><td class="mono">${esc(r.detail)}</td></tr>`).join("")}
+  </tbody></table>`;
+}
+
+const LEGEND = `<div class="legend">
+  <span><i class="sw" style="background:#dcfce7;border-color:#16a34a"></i>added</span>
+  <span><i class="sw" style="background:#fef3c7;border-color:#d97706"></i>changed</span>
+  <span><i class="sw" style="background:#fee2e2;border-color:#dc2626"></i>removed</span>
+  <span><i class="sw" style="background:#f1f5f9;border-color:#94a3b8"></i>context</span>
+  <span><i class="sw" style="background:#e0e7ff;border-color:#6366f1"></i>external package</span></div>`;
+
+async function show() {
+  const m = state.manifest;
+  const c = m.cycles.find((x) => x.id === state.sel);
+  if (!c) return;
+  const key = c.id + "|" + c.status + "|" + state.diff;
+  if (key === state.shown) return;
+  state.shown = key;
+  const main = $("#main");
+  const head = `<header class="top"><div><h2>Cycle #${c.n}</h2>
+      <div class="meta mono">head ${esc(c.head.slice(0, 10))} · cycle base ${esc(c.cycle_base.slice(0, 10))} · task base ${esc(c.task_base.slice(0, 10))}</div></div>
+      <div class="seg"><button data-d="cycle" class="${state.diff === "cycle" ? "on" : ""}">this cycle</button><button data-d="task" class="${state.diff === "task" ? "on" : ""}">whole task</button></div></header>`;
+  if (c.status === "running") { main.innerHTML = head + '<section><p class="empty">Building this view…</p></section>'; bindSeg(); return; }
+  if (c.status === "error") { main.innerHTML = head + `<section><h3>Build failed</h3><div class="err-box mono">${esc(c.error)}</div></section>`; bindSeg(); return; }
+  let v;
+  try { v = await (await fetch(c.id + "/view.json", { cache: "no-store" })).json(); }
+  catch (e) { main.innerHTML = head + `<section><div class="err-box">Can't load view: ${esc(e)}</div></section>`; return; }
+  const d = v.diffs[state.diff];
+  const s = d.summary;
+  main.innerHTML = head + `
+    <section id="s-api"><h3>External API changes <span class="badge">${s.api_changes}</span>
+      ${s.breaking ? `<span class="badge break">${s.breaking} breaking</span>` : ""}</h3>${apiTable(d.api)}</section>
+    <section id="s-borders"><h3>Module borders <span class="badge">head, colored by whole-task change</span></h3>${LEGEND}</section>
+    <section id="s-graph"><h3>Dependency graph diff <span class="badge">${s.modules_touched} contracts touched</span></h3>${LEGEND}</section>
+    <section id="s-imp"><h3>Impacted contracts <span class="badge">${s.symbols_touched} symbols</span></h3></section>
+    <section id="s-seq"><h3>Sequence diagrams <span class="badge">${v.sequences.length}</span></h3></section>`;
+  bindSeg();
+  await diagram($("#s-borders"), v.borders);
+  await diagram($("#s-graph"), d.graph);
+  await diagram($("#s-imp"), d.impacted);
+  const seqBox = $("#s-seq");
+  if (!v.sequences.length) seqBox.insertAdjacentHTML("beforeend", '<p class="empty">No new tests this cycle and no scenarios configured.</p>');
+  for (const [i, t] of v.sequences.entries()) {
+    const det = document.createElement("details");
+    det.className = "seq";
+    det.open = i < 3;
+    const ok = t.status === "Success";
+    det.innerHTML = `<summary><span class="mono">${esc(t.test)}</span>
+      <span class="badge ${t.why === "new" ? "new" : ""}">${esc(t.why || "test")}</span>
+      <span class="badge ${ok ? "" : "err"}">${esc(t.status)}</span></summary>`;
+    seqBox.appendChild(det);
+    if (t.error) det.insertAdjacentHTML("beforeend", `<div class="err-box mono">${esc(t.error)}</div>`);
+    if (t.reason) det.insertAdjacentHTML("beforeend", `<p class="meta mono">${esc(t.reason)}</p>`);
+    await diagram(det, t.mermaid);
+  }
+}
+
+function bindSeg() {
+  document.querySelectorAll(".seg button").forEach((b) => b.onclick = () => { state.diff = b.dataset.d; writeHash(); show(); });
+}
+
+async function poll() {
+  try {
+    const m = await (await fetch("manifest.json", { cache: "no-store" })).json();
+    state.manifest = m;
+    if ($("#follow").checked || !state.sel) {
+      const latest = [...m.cycles].reverse().find((c) => c.status !== "running") || m.cycles[m.cycles.length - 1];
+      if (latest) state.sel = latest.id;
+    }
+    renderList();
+    await show();
+  } catch (e) {
+    $("#task").textContent = "no manifest yet (" + (e.message || e) + ")";
+  }
+}
+
+$("#follow").onchange = () => { writeHash(); poll(); };
+readHash();
+poll();
+setInterval(poll, 5000);
+setInterval(() => state.manifest && renderList(), 30000);
+</script>
+</body>
+</html>

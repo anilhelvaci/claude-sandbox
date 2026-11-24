@@ -53,9 +53,9 @@ def run_step(name: str, cmd: str) -> bool:
 
 
 def test_files(base: str) -> list[str]:
-    """Test files added or modified since <base>."""
+    """Runnable test files (config 'test_files') added or modified since <base>."""
     changed = lib.git("diff", "--name-only", "--no-renames", "--diff-filter=AM", base, "HEAD")
-    return [f for f in lib.split_lines(changed) if lib.is_test_path(f)]
+    return [f for f in lib.split_lines(changed) if lib.is_runnable_test(f)]
 
 
 PRESENT = {"pass": "passes", "fail": "fails"}
@@ -146,7 +146,7 @@ def _new_tests_must(expect: str, args: list[str]) -> int:
     base = args[0] if args and args[0] else turn_base()
     files = test_files(base)
     if not files:
-        print(f"  FAIL  no test files added or changed since {base[:10]}")
+        print(f"  FAIL  no runnable test files (config 'test_paths' + 'test_files') added or changed since {base[:10]}")
         return 1
     return 0 if run_tests(expect, files) else 1
 
@@ -180,12 +180,19 @@ def cmd_prover(args: list[str]) -> int:
     restoring is just 'reset --hard'."""
     if not args or not args[0]:
         lib.die("usage: gate prover <base> <file>...")
-    base, files = args[0], args[1:]
-    if not files:
+    base, listed = args[0], args[1:]
+    if not listed:
         print("  ok    prover: no red tests this cycle (defensive only), skipped")
         return 0
     if lib.changed_paths():
         lib.die("prover needs a clean tree")
+    # Only runnable test files go to 'test_only' (fixtures and helpers don't).
+    files = [f for f in listed if lib.is_runnable_test(f)]
+    if not files:
+        print(f"  FAIL  prover: none of {' '.join(listed)} is a runnable test file (config 'test_files')")
+        return 1
+    if len(files) < len(listed):
+        print(f"  ..    prover: skipped {len(listed) - len(files)} non-runnable test path(s) (config 'test_files')")
     production = []
     for line in lib.split_lines(lib.git("diff", "--name-status", "--no-renames", base, "HEAD")):
         status, _, path = line.partition("\t")
@@ -247,11 +254,15 @@ COMMANDS = [
         "[base]",
         "each test file added/changed since <base> FAILS",
         """
-        Runs the config's 'test_only' command on the test files added or modified
-        since <base>; each must fail. This is the tester's proof that the new tests
-        demand something the code doesn't do yet. The tail of each failing run is
-        printed, so the builder can see the failure is for the right reason (a typo
-        fails too). Fails outright if no test file changed.
+        Runs the config's 'test_only' command on the runnable test files added or
+        modified since <base>; each must fail. This is the tester's proof that the
+        new tests demand something the code doesn't do yet. The tail of each failing
+        run is printed, so the builder can see the failure is for the right reason
+        (a typo fails too). Fails outright if no runnable test file changed.
+
+        Runnable test files are the test paths ('test_paths') that match the config's
+        'test_files' patterns; fixtures and helpers under the test paths are left
+        out. Without 'test_files', every changed test path counts.
 
         <base> defaults to the commit where the current turn began.
         """,
@@ -263,8 +274,8 @@ COMMANDS = [
         "each test file added/changed since <base> PASSES",
         """
         The opposite of 'red', for defensive coverage: tests that pin behavior the code
-        already has. Each test file added or modified since <base> must pass. Used by
-        'bus handoff builder --defensive "<why>"'.
+        already has. Each runnable test file (see 'red') added or modified since
+        <base> must pass. Used by 'bus handoff builder --defensive "<why>"'.
 
         <base> defaults to the commit where the current turn began.
         """,
@@ -288,12 +299,14 @@ COMMANDS = [
         """
         Regression evidence: proves the builder's change is what makes the tests pass.
         Needs a clean tree. It reverts every non-test file changed since <base> in
-        place (files added since <base> are deleted), runs each listed test file
-        (each must fail), then restores HEAD with 'git reset --hard HEAD', even if
-        something goes wrong.
+        place (files added since <base> are deleted; test paths, fixtures included,
+        are left alone), runs each listed runnable test file (each must fail), then
+        restores HEAD with 'git reset --hard HEAD', even if something goes wrong.
+        Listed paths that aren't runnable test files (config 'test_files') are skipped.
 
-        With no files (a cycle of defensive tests only) it passes and skips. With no
-        production change since <base> it fails: nothing made the tests pass.
+        With no files (a cycle of defensive tests only) it passes and skips. It fails
+        if none of the listed files is runnable, or if there's no production change
+        since <base>: then nothing made the tests pass.
         """,
         cmd_prover,
     ),
