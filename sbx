@@ -36,6 +36,8 @@ SBX_SKILLS_SRC = Path(
     os.environ.get("SBX_SKILLS_SRC") or os.path.expanduser("~/.claude/skills")
 )  # where 'sbx skills add' copies from
 FIREWALL_SCRIPT = "/usr/local/bin/init-firewall"
+PLUGINS_MOUNT = "/opt/sbx/plugins"  # gate plugins, read-only in the fleet container
+PLUGIN_MANIFEST = "sbx-plugin.conf"
 ROLES = ("tester", "builder", "reviewer")
 
 
@@ -147,6 +149,8 @@ def ensure_running(name: str) -> None:
                 die("firewall failed; container stopped")
     if subprocess.run(["docker", "exec", c, "test", "-x", "/opt/sbx/bin/bus"]).returncode != 0:
         warn(f"'{name}' predates roles/bus/gate; recreate it to get them: sbx rm {name} (the clone is kept)")
+    elif cfg_get(name, "plugin") and subprocess.run(["docker", "exec", c, "test", "-d", PLUGINS_MOUNT]).returncode:
+        warn(f"'{name}' predates gate plugins; recreate it to mount them: sbx rm {name} (clone and plugins are kept)")
     # One tmux session per sandbox; each agent is a window in it.
     if (
         subprocess.run(
@@ -195,6 +199,9 @@ def start_container(name: str) -> None:
         f"{project}:/etc/sbx/project:ro",
         f"{project}/skills:/home/ubuntu/.claude/skills:ro",
         f"sbx-{name}-cache:/home/ubuntu/.cache",
+        # Gate plugins: installed by 'sbx plugins add' from a separate container;
+        # read-only here, so agents can't change the tools that gate them.
+        f"{plugins_volume(name)}:{PLUGINS_MOUNT}:ro",
     ]
     cmd = ["docker", "run", "-d", "--name", cname(name), "--hostname", name]
     for mount in mounts:
@@ -262,6 +269,7 @@ def cmd_new(args: list[str]) -> int:
     ensure_running(name)
     print(f"sandbox '{name}' ready: {repo} (firewall {'on' if firewall_on(name) else 'OFF'})")
     print(f"  sbx login {name}          log Claude in (once for all sandboxes)")
+    print(f"  sbx plugins {name} add <url>   optional gate plugins (before the first task)")
     print(f"  sbx agent {name} <task>   start an agent in its own worktree")
     print(f"  sbx attach {name}         watch the fleet (tmux)")
     return 0
@@ -674,11 +682,240 @@ def cmd_ls(args: list[str]) -> int:
     return 0
 
 
+# ---- gate plugins -----------------------------------------------------------
+# A plugin is a tool whose author ships an sbx-plugin.conf manifest. It's installed
+# into a per-sandbox volume by a throwaway container with open network that sees
+# nothing but the plugin's checkout and that volume; the fleet container mounts the
+# volume read-only and never runs without its firewall.
+
+
+def plugins_volume(name: str) -> str:
+    return f"sbx-{name}-plugins"
+
+
+def parse_conf(text: str) -> dict[str, list[str]]:
+    """'key = value' lines (the project config format); mirrors sbx_lib.parse_conf."""
+    out: dict[str, list[str]] = {}
+    for line in text.split("\n"):
+        if line.lstrip().startswith("#"):
+            continue
+        m = re.match(r"^\s*([A-Za-z0-9_.\-]+)\s*=\s*(.*)$", line)
+        if m:
+            out.setdefault(m.group(1), []).append(m.group(2).rstrip())
+    return out
+
+
+def plugin_records(name: str) -> dict[str, str]:
+    """plugin name -> source ('<url-or-path>@<sha>') from the project config."""
+    try:
+        conf = parse_conf((project_dir(name) / "config").read_text())
+    except OSError:
+        return {}
+    records = {}
+    for value in conf.get("plugin", []):
+        parts = value.split(None, 1)
+        if parts:
+            records[parts[0]] = parts[1] if len(parts) > 1 else ""
+    return records
+
+
+def set_plugin_record(name: str, plugin: str, source: str | None) -> None:
+    """Write (or with None, remove) 'plugin = <plugin> <source>' and its mode line."""
+    config = project_dir(name) / "config"
+    lines = config.read_text().split("\n") if config.exists() else []
+    mine = re.compile(r"^\s*plugin\s*=\s*" + re.escape(plugin) + r"(\s|$)")
+    mode = re.compile(r"^\s*plugin\." + re.escape(plugin) + r"\s*=")
+    had_mode = any(mode.match(line) for line in lines)
+    kept = [line for line in lines if not mine.match(line) and not (source is None and mode.match(line))]
+    while kept and kept[-1] == "":
+        kept.pop()
+    if source is not None:
+        kept.append(f"plugin = {plugin} {source}")
+        if not had_mode:
+            kept.append(f"plugin.{plugin} = block")
+    config.write_text("\n".join(kept) + "\n")
+
+
+def split_source(source: str) -> tuple[str, str]:
+    """'<url-or-path>[@ref]' -> (location, ref). An '@' before ':' (git@host:...) isn't a ref."""
+    loc, sep, ref = source.rpartition("@")
+    if sep and loc and ref and "/" not in ref and ":" not in ref:
+        return loc, ref
+    return source, ""
+
+
+def fetch_plugin(source: str, workdir: str) -> tuple[str, str, str]:
+    """Check the plugin out on the host. Returns (checkout dir, location, resolved sha or 'local')."""
+    loc, ref = split_source(source)
+    local = os.path.isdir(os.path.expanduser(loc))
+    if local:
+        loc = os.path.abspath(os.path.expanduser(loc))
+        if not ref:
+            sha = output("git", "-C", loc, "rev-parse", "HEAD", check=False) or "local"
+            return loc, loc, sha
+    checkout = os.path.join(workdir, "src")
+    run("git", "clone", "--quiet", loc, checkout)
+    if ref:
+        run("git", "-C", checkout, "checkout", "--quiet", ref)
+    return checkout, loc, output("git", "-C", checkout, "rev-parse", "HEAD")
+
+
+def install_plugin(name: str, source: str) -> int:
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="sbx-plugin-") as work:
+        checkout, loc, sha = fetch_plugin(source, work)
+        try:
+            manifest = parse_conf((Path(checkout) / PLUGIN_MANIFEST).read_text())
+        except OSError:
+            die(f"{loc} has no {PLUGIN_MANIFEST} at its root: ask its author for one (see 'sbx help plugins')")
+        plugin = (manifest.get("name") or [""])[0]
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", plugin):
+            die(f"{PLUGIN_MANIFEST}: 'name' must be lowercase letters, digits, '-' or '_' (got '{plugin}')")
+        if not (manifest.get("run") or [""])[0]:
+            die(f"{PLUGIN_MANIFEST}: no 'run' line")
+        stack, want = (manifest.get("stack") or [""])[0], cfg_get(name, "stack")
+        if stack and want and stack != want:
+            warn(f"plugin '{plugin}' is for stack '{stack}'; this project's stack is '{want}'")
+        prefix = f"{PLUGINS_MOUNT}/{plugin}"
+        state = f"/home/ubuntu/.cache/sbx-plugins/{plugin}"  # = sbx_lib.plugin_state in the fleet
+        install = (
+            (manifest.get("install") or [""])[0]
+            .replace("{prefix}", shlex.quote(prefix))
+            .replace("{state}", shlex.quote(state))
+        )
+        vol = plugins_volume(name)
+        print(f"installing plugin '{plugin}' from {loc} @ {sha[:12]} (network open, outside the fleet)", flush=True)
+        # The volume starts root-owned; give it to the image's user.
+        run(
+            "docker",
+            "run",
+            "--rm",
+            "-u",
+            "root",
+            "-v",
+            f"{vol}:{PLUGINS_MOUNT}",
+            SBX_IMAGE,
+            "chown",
+            "ubuntu:ubuntu",
+            PLUGINS_MOUNT,
+            quiet=True,
+        )
+        script = (
+            'set -euo pipefail\nP="$PLUGIN_PREFIX"\nrm -rf "$P"\nmkdir -p "$P/bin" "$P/home"\n'
+            'cp -a /plugin-src/. "$P/src"\ncd "$P/src"\n' + (f"{install}\n" if install else "")
+        )
+        rc = subprocess.run(
+            [
+                "docker", "run", "--rm",
+                "-v", f"{vol}:{PLUGINS_MOUNT}",
+                "-v", f"{checkout}:/plugin-src:ro",
+                "-e", f"PLUGIN_PREFIX={prefix}",
+                "-e", f"HOME={prefix}/home",
+                "-e", f"PATH={prefix}/bin:{prefix}/home/.local/bin:/home/ubuntu/.foundry/bin:"
+                      "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "-e", "UV_CACHE_DIR=/tmp/uv-cache",
+                "-e", "UV_LINK_MODE=copy",
+                SBX_IMAGE, "bash", "-c", script,
+            ]
+        ).returncode  # fmt: skip
+        if rc != 0:
+            warn(f"install of '{plugin}' failed (exit {rc}); its gate fails until it installs")
+            return rc
+    set_plugin_record(name, plugin, f"{loc}@{sha}")
+    domains = [d for v in manifest.get("allowlist", []) for d in v.split()]
+    allow = sandbox_dir(name) / "allowlist" / f"plugin-{plugin}.txt"
+    if domains:
+        allow.parent.mkdir(parents=True, exist_ok=True)
+        allow.write_text(f"# from plugin {plugin} ({PLUGIN_MANIFEST} 'allowlist')\n" + "\n".join(domains) + "\n")
+    elif allow.exists():
+        allow.unlink()
+    refresh_firewall(name)
+    print(f"plugin '{plugin}' installed; 'gate green' runs it (plugin.{plugin} = block | off in the project config)")
+    return 0
+
+
+def refresh_firewall(name: str) -> None:
+    """Re-apply the allowlist in a running, firewalled container (plugins may add domains)."""
+    if (
+        firewall_on(name)
+        and output("docker", "inspect", "-f", "{{.State.Running}}", cname(name), check=False) == "true"
+    ):
+        apply_firewall(name)
+
+
+def cmd_plugins(args: list[str]) -> int:
+    name = need_name(args)
+    op = args[1] if len(args) > 1 and args[1] else "ls"
+    rest = args[2:]
+    if not project_dir(name).is_dir():
+        die(f"no sandbox '{name}' project dir ({project_dir(name)})")
+    records = plugin_records(name)
+    if op == "ls":
+        vol = plugins_volume(name)
+        installed = output(
+            "docker", "run", "--rm", "-v", f"{vol}:{PLUGINS_MOUNT}:ro", SBX_IMAGE,
+            "bash", "-c", f"cd {PLUGINS_MOUNT} && ls -1", check=False,
+        ).split("\n")  # fmt: skip
+        if not records:
+            print("(no plugins)")
+        for plugin, source in records.items():
+            mode = cfg_get(name, f"plugin.{plugin}", "block")
+            state = "installed" if plugin in installed else "NOT INSTALLED"
+            print(f"{plugin:<20} {mode:<6} {state:<14} {source}")
+        return 0
+    if op == "add":
+        if not rest:
+            die("usage: sbx plugins <name> add <git-url-or-path>[@ref]...")
+        if any(d.is_dir() for d in (repo_dir(name) / ".git" / "sbx").glob("*")):
+            warn("tasks already exist: a gate running during the install may see a half-installed tool")
+        rc = 0
+        for source in rest:
+            rc = install_plugin(name, source) or rc
+        return rc
+    if op == "update":
+        targets = rest or list(records)
+        rc = 0
+        for plugin in targets:
+            if plugin not in records:
+                die(f"no plugin '{plugin}' (sbx plugins {name} ls)")
+            loc, _ = split_source(records[plugin])
+            rc = install_plugin(name, loc) or rc  # latest of the default branch (or the path's HEAD)
+        return rc
+    if op == "rm":
+        for plugin in rest:
+            if plugin not in records:
+                die(f"no plugin '{plugin}' (sbx plugins {name} ls)")
+            run(
+                "docker",
+                "run",
+                "--rm",
+                "-u",
+                "root",
+                "-v",
+                f"{plugins_volume(name)}:{PLUGINS_MOUNT}",
+                SBX_IMAGE,
+                "rm",
+                "-rf",
+                f"{PLUGINS_MOUNT}/{plugin}",
+                quiet=True,
+            )
+            set_plugin_record(name, plugin, None)
+            allow = sandbox_dir(name) / "allowlist" / f"plugin-{plugin}.txt"
+            if allow.exists():
+                allow.unlink()
+            print(f"removed {plugin}")
+        refresh_firewall(name)
+        return 0
+    die("usage: sbx plugins <name> [ls | add <url-or-path>[@ref]... | update [plugin...] | rm <plugin>...]")
+
+
 def cmd_rm(args: list[str]) -> int:
     name = need_name(args)
     succeeds("docker", "rm", "-f", cname(name))
     succeeds("docker", "volume", "rm", f"sbx-{name}-cache")
     print(f"container removed; the clone is kept at {repo_dir(name)} (delete it yourself if you're done)")
+    print(f"installed plugins are kept in the volume {plugins_volume(name)} ('docker volume rm' it if you're done)")
     return 0
 
 
@@ -852,6 +1089,45 @@ COMMANDS = [
           sbx skills proto add x-ray fizz solidity-auditor
         """,
         cmd_skills,
+    ),
+    Command(
+        "plugins",
+        "<name> [ls | add <url-or-path>[@ref]... | update [plugin...] | rm <plugin>...]",
+        "gate plugins: tools 'gate green' runs on each cycle's diff",
+        """
+        A plugin is a tool whose author ships an 'sbx-plugin.conf' at its repo root.
+        Add plugins before the first task.
+
+          ls                       plugins in the config: mode, installed or not, source
+          add <src>[@ref]...       clone <src> (git URL or local path) on the Mac, then
+                                   install it in a throwaway container (network open, sees
+                                   only the plugin and the plugin volume); records
+                                   'plugin = <name> <src>@<sha>' and 'plugin.<name> = block'
+          update [plugin...]       reinstall from the recorded source's latest commit
+          rm <plugin>...           uninstall and drop it from the config
+
+        The fleet container mounts the plugin volume (sbx-<name>-plugins) read-only at
+        /opt/sbx/plugins and keeps its firewall: agents can't change the tools that gate
+        them. 'plugin.<name> = off' in the config disables one without uninstalling it.
+
+        The manifest ('key = value', '#' comments):
+          name      = crap4sol                     required: [a-z0-9_-]
+          run       = crap4sol --changed           required; {base} {changed} {prefix} {state}
+          install   = ./install.sh {prefix}/bin    runs at add, cwd = the checkout, HOME
+                                                   inside {prefix}; put everything under it
+                                                   ({prefix} is read-only in the fleet: link
+                                                   what the tool writes to {state})
+          exit.2    = finding                      the code's fault (others: error)
+          exit.3    = error                        the tool's fault
+          stack     = solidity                     warns on a mismatch
+          brief     = BRIEF.md                     shown to the builder and reviewer
+          allowlist = binaries.soliditylang.org    domains it needs at run time
+
+        examples:
+          sbx plugins proto add https://github.com/acme/tool@v1.2.0
+          sbx plugins proto add ~/code/my-tool
+        """,
+        cmd_plugins,
     ),
     Command(
         "merge",

@@ -19,6 +19,7 @@ Everything is Python 3 (standard library only). Every command explains itself:
 - [How it fits together](#how-it-fits-together)
 - [Working with independent agents](#working-with-independent-agents)
 - [Teams: tester, builder, reviewer](#teams-tester-builder-reviewer)
+- [Gate plugins](#gate-plugins)
 - [Bringing work back](#bringing-work-back)
 - [Firewall](#firewall)
 - [Command reference](#command-reference)
@@ -197,6 +198,50 @@ edit their roles, the gate or its config.
 Echidna and Medusa aren't in the image yet. Slither is (`--build-arg WITH_SLITHER=0` to
 leave it out, `--build-arg SLITHER_VERSION=x.y.z` to pin it).
 
+## Gate plugins
+
+A plugin is an extra tool that `gate green` runs on each cycle's diff, packaged by
+its author with an `sbx-plugin.conf` at the root of the tool's repo. Add plugins after
+`sbx new` and before the first task:
+
+```sh
+sbx plugins proto add https://github.com/acme/tool@v1.2.0   # or a local path
+sbx plugins proto ls                                         # mode, installed?, source@sha
+```
+
+- **Install.** `add` clones the plugin on the Mac and runs its `install` line in a
+  throwaway container with open network. That container sees only the plugin's checkout
+  and the sandbox's plugin volume (`sbx-<name>-plugins`); it never sees the clone or the
+  Claude login. The fleet container mounts the volume read-only at `/opt/sbx/plugins`
+  and keeps its firewall, so agents can't change the tools that gate them. The resolved
+  commit goes in the config as `plugin = <name> <source>@<sha>`; `update` reinstalls
+  from the latest commit, `rm` uninstalls.
+- **Run.** After `build`, `test` and every `check`, `gate green` runs each plugin's `run`
+  line with `{base}` (the open cycle's base: the same diff the panel reviews) and
+  `{changed}` (files added or modified since then). Exit 0 passes. Any other exit fails
+  the gate, reported as a **finding** (the code must change) or a **tool error**,
+  according to the manifest's `exit.<code>` lines.
+- **Agents.** The builder's and reviewer's prompts list each plugin, its exit meanings
+  and its author's brief.
+- **Modes.** `plugin.<name> = block` (the default) or `off`. An advisory mode, where
+  findings go to the panel instead of blocking, is planned.
+
+The manifest, for tool authors (`key = value`, `#` comments):
+
+| Key | Meaning |
+|---|---|
+| `name` | Required. `[a-z0-9_-]`; installed at `/opt/sbx/plugins/<name>` |
+| `run` | Required. A bash line run in the worktree; `{base}`, `{changed}`, `{prefix}`, `{state}` are substituted, and `{prefix}/bin` is on `PATH` |
+| `install` | Run once at `add`, in `{prefix}/src` (the checkout) with `HOME={prefix}/home`. Install everything under `{prefix}`: it's read-only in the fleet |
+| `exit.<code>` | `finding` or `error`. Unlisted nonzero codes are errors |
+| `brief` | A Markdown file in the repo, shown to the builder and reviewer |
+| `stack` | Warns when it doesn't match the project's `stack` |
+| `allowlist` | Domains the tool needs at run time; added to the sandbox's firewall |
+
+`{state}` (`~/.cache/sbx-plugins/<name>`) is the plugin's writable directory in the fleet:
+point whatever the tool writes at run time there (the install can symlink it).
+`docs/plugin-example/crap4sol/` is a worked example.
+
 ## Bringing work back
 
 For a finished team task, `sbx merge <name> <task>` puts the work on the task's own branch
@@ -263,6 +308,7 @@ Every command has its own help: `sbx help <command>` or `sbx <command> --help`.
 | `sbx inbox <name>` | Your unread messages from every team |
 | `sbx proxy <name>` | Start the proxy (it acts only while the config says `proxy = on`) |
 | `sbx skills <name> [ls \| add <skill>... \| rm <skill>...]` | The stack skills this sandbox's agents see, copied from `$SBX_SKILLS_SRC` |
+| `sbx plugins <name> [ls \| add <src>[@ref]... \| update [plugin...] \| rm <plugin>...]` | Gate plugins: install, list, update, remove |
 | `sbx merge <name> <task> [--branch B] [--yes] [--force]` | Put a finished task's work on its own branch in the repo you cloned from |
 | `sbx attach <name>` | Attach to the fleet's tmux session (detach: `Ctrl-b d`) |
 | `sbx shell <name>` | bash in the container as the agents' user |
@@ -287,7 +333,7 @@ Every command has its own help: `sbx help <command>` or `sbx <command> --help`.
 | `gate clean` | Every change is committed |
 | `gate paths <role> [base]` | The role touched only what it owns |
 | `gate red [base]` / `gate defensive [base]` | Each new or changed test file fails / passes |
-| `gate green` | Build, the full suite and every check pass |
+| `gate green` | Build, the full suite, every check and every gate plugin pass |
 | `gate prover <base> <file>...` | With production changes reverted, the tests fail again |
 | `panel [base]` | Run the reviewer seats; verdict `pass` (exit 0), `changes` (3) or `error` (1) |
 | `proxy loop [seconds]` / `proxy tick` | The proxy's watch loop, or one pass |
@@ -312,12 +358,14 @@ setups.
 | `protected` | Paths no agent may change |
 | `scratch` | Paths the gate ignores (agent notes, reports) |
 | `build`, `test`, `check` | `gate green`: build (optional), the full suite (required), then each `check` |
+| `test_files` | Optional: which test paths are runnable test files, e.g. `test_*.py */test_*.py`. Only these go to `test_only`; fixtures and helpers under `test_paths` don't. Unset: every test path is runnable |
 | `test_only` | Runs only the given test files; must contain `{file}` (each file on its own) or `{files}` (all together) |
 | `seats` | Juror seats from `roles/jurors/`, or `none` for no reviewer (default: all four) |
 | `seat_model`, `seat_timeout` | Model and timeout in seconds (default 900) for each seat |
 | `max_rounds` | Review rounds per cycle before escalating to you (default 4) |
 | `proxy`, `proxy_grace`, `proxy_max`, `proxy_timeout` | The proxy: `on`/`off` (default off), seconds to wait for you first (600), decisions per task (3, or `unlimited`), its timeout (900) |
 | `skills.tester`, `skills.builder`, `skills.reviewer` | Skills (by directory name) each role is told to use |
+| `plugin`, `plugin.<name>` | Gate plugins, written by `sbx plugins`: `<name> <source>@<sha>`, and `block` (default) or `off` |
 
 Next to it: `tester.md`, `builder.md` and `reviewer.md` (notes for each role; the
 reviewer's also go to every panel seat), `proxy.md` (your standing preferences for the
@@ -353,6 +401,7 @@ claude-sandbox/
   roles/               role briefs (COMMON, tester, builder, reviewer, proxy, jurors/)
   skills/              shared disciplines (regression evidence, adversarial tests)
   templates/project/   the starting project config and role notes
+  docs/plugin-example/ a sample gate plugin manifest (crap4sol)
 
 $SBX_HOME/<name>/
   repo/                the clone (.worktrees/<task> for each task)

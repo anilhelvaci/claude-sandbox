@@ -8,6 +8,7 @@ agents run them by hand to check their work early. Exit 0 = pass.
 
 from __future__ import annotations
 
+import os
 import shlex
 import subprocess
 from pathlib import Path
@@ -53,9 +54,9 @@ def run_step(name: str, cmd: str) -> bool:
 
 
 def test_files(base: str) -> list[str]:
-    """Test files added or modified since <base>."""
+    """Runnable test files (config 'test_files') added or modified since <base>."""
     changed = lib.git("diff", "--name-only", "--no-renames", "--diff-filter=AM", base, "HEAD")
-    return [f for f in lib.split_lines(changed) if lib.is_test_path(f)]
+    return [f for f in lib.split_lines(changed) if lib.is_runnable_test(f)]
 
 
 PRESENT = {"pass": "passes", "fail": "fails"}
@@ -146,7 +147,7 @@ def _new_tests_must(expect: str, args: list[str]) -> int:
     base = args[0] if args and args[0] else turn_base()
     files = test_files(base)
     if not files:
-        print(f"  FAIL  no test files added or changed since {base[:10]}")
+        print(f"  FAIL  no runnable test files (config 'test_paths' + 'test_files') added or changed since {base[:10]}")
         return 1
     return 0 if run_tests(expect, files) else 1
 
@@ -170,7 +171,62 @@ def cmd_green(args: list[str]) -> int:
     for check in lib.conf_all("check"):
         if check:
             ok = run_step("check", check) and ok
+    for name in lib.plugins_enabled():
+        ok = run_plugin(name) and ok
     return 0 if ok else 1
+
+
+def plugin_base() -> str:
+    """What a plugin judges: the open cycle's diff (what the panel reviews), else the turn's."""
+    return lib.state_get("cycle_base") or turn_base()
+
+
+def run_plugin(name: str) -> bool:
+    """Run one gate plugin's 'run' line. Exit 0 passes; the manifest's exit.<code>
+    says whether another code is a 'finding' (the code's fault) or an 'error' (the
+    tool's); both fail the gate. Unmapped codes are errors."""
+    manifest = lib.plugin_manifest(name)
+    if manifest is None:
+        print(f"  FAIL  plugin {name}: not installed (on the host: sbx plugins <sandbox> add <its source>)")
+        return False
+    run = (manifest.get("run") or [""])[0]
+    if not run:
+        print(f"  FAIL  plugin {name}: its {lib.PLUGIN_MANIFEST} has no 'run'")
+        return False
+    base = plugin_base()
+    changed = lib.git("diff", "--name-only", "--no-renames", "--diff-filter=AM", base, "HEAD")
+    prefix = lib.SBX_PLUGINS / name
+    state = lib.plugin_state(name)
+    state.mkdir(parents=True, exist_ok=True)
+    cmd = (
+        run.replace("{base}", shlex.quote(base))
+        .replace("{changed}", " ".join(shlex.quote(f) for f in lib.split_lines(changed)))
+        .replace("{prefix}", shlex.quote(str(prefix)))
+        .replace("{state}", shlex.quote(str(state)))
+    )
+    env = {
+        **os.environ,
+        "PATH": f"{prefix / 'bin'}:{os.environ.get('PATH', '')}",
+        "SBX_PLUGIN_PREFIX": str(prefix),
+        "SBX_PLUGIN_STATE": str(state),
+        "SBX_BASE": base,
+    }
+    log = log_dir() / f"{lib.stamp()}-plugin-{name}.log"
+    with open(log, "w") as out:
+        rc = subprocess.run(["bash", "-c", cmd], stdout=out, stderr=subprocess.STDOUT, env=env).returncode
+    if rc == 0:
+        print(f"  ok    plugin {name}: {cmd}")
+        return True
+    meaning = (manifest.get(f"exit.{rc}") or ["error"])[0]
+    if meaning == "finding":
+        print(f"  FAIL  plugin {name}: finding (exit {rc}): {cmd}  (log: {log})")
+    else:
+        print(
+            f"  FAIL  plugin {name}: tool error (exit {rc}), not necessarily your code; "
+            f"escalate if it persists: {cmd}  (log: {log})"
+        )
+    indented_tail(log, 30)
+    return False
 
 
 def cmd_prover(args: list[str]) -> int:
@@ -180,12 +236,19 @@ def cmd_prover(args: list[str]) -> int:
     restoring is just 'reset --hard'."""
     if not args or not args[0]:
         lib.die("usage: gate prover <base> <file>...")
-    base, files = args[0], args[1:]
-    if not files:
+    base, listed = args[0], args[1:]
+    if not listed:
         print("  ok    prover: no red tests this cycle (defensive only), skipped")
         return 0
     if lib.changed_paths():
         lib.die("prover needs a clean tree")
+    # Only runnable test files go to 'test_only' (fixtures and helpers don't).
+    files = [f for f in listed if lib.is_runnable_test(f)]
+    if not files:
+        print(f"  FAIL  prover: none of {' '.join(listed)} is a runnable test file (config 'test_files')")
+        return 1
+    if len(files) < len(listed):
+        print(f"  ..    prover: skipped {len(listed) - len(files)} non-runnable test path(s) (config 'test_files')")
     production = []
     for line in lib.split_lines(lib.git("diff", "--name-status", "--no-renames", base, "HEAD")):
         status, _, path = line.partition("\t")
@@ -247,11 +310,15 @@ COMMANDS = [
         "[base]",
         "each test file added/changed since <base> FAILS",
         """
-        Runs the config's 'test_only' command on the test files added or modified
-        since <base>; each must fail. This is the tester's proof that the new tests
-        demand something the code doesn't do yet. The tail of each failing run is
-        printed, so the builder can see the failure is for the right reason (a typo
-        fails too). Fails outright if no test file changed.
+        Runs the config's 'test_only' command on the runnable test files added or
+        modified since <base>; each must fail. This is the tester's proof that the
+        new tests demand something the code doesn't do yet. The tail of each failing
+        run is printed, so the builder can see the failure is for the right reason
+        (a typo fails too). Fails outright if no runnable test file changed.
+
+        Runnable test files are the test paths ('test_paths') that match the config's
+        'test_files' patterns; fixtures and helpers under the test paths are left
+        out. Without 'test_files', every changed test path counts.
 
         <base> defaults to the commit where the current turn began.
         """,
@@ -263,8 +330,8 @@ COMMANDS = [
         "each test file added/changed since <base> PASSES",
         """
         The opposite of 'red', for defensive coverage: tests that pin behavior the code
-        already has. Each test file added or modified since <base> must pass. Used by
-        'bus handoff builder --defensive "<why>"'.
+        already has. Each runnable test file (see 'red') added or modified since
+        <base> must pass. Used by 'bus handoff builder --defensive "<why>"'.
 
         <base> defaults to the commit where the current turn began.
         """,
@@ -273,11 +340,17 @@ COMMANDS = [
     Command(
         "green",
         "",
-        "build, full test suite and every 'check' pass",
+        "build, full test suite, every 'check' and every gate plugin pass",
         """
         Runs, from the config, 'build' (if set), then 'test' (required), then every
-        'check' line, each logged separately. All of them run even after a failure,
-        so you see every problem at once. A failure prints the last 20 lines of its log.
+        'check' line, then every enabled gate plugin ('plugin' lines), each logged
+        separately. All of them run even after a failure, so you see every problem at
+        once. A failure prints the tail of its log.
+
+        A plugin judges the open cycle's diff (the panel's base; else the turn's):
+        its 'run' line gets {base} and {changed} (files added or modified since then).
+        Its failure says 'finding' (fix the code) or 'tool error' (the tool itself
+        failed: retry, then escalate). Your role prompt lists each plugin's brief.
         """,
         cmd_green,
     ),
@@ -288,12 +361,14 @@ COMMANDS = [
         """
         Regression evidence: proves the builder's change is what makes the tests pass.
         Needs a clean tree. It reverts every non-test file changed since <base> in
-        place (files added since <base> are deleted), runs each listed test file
-        (each must fail), then restores HEAD with 'git reset --hard HEAD', even if
-        something goes wrong.
+        place (files added since <base> are deleted; test paths, fixtures included,
+        are left alone), runs each listed runnable test file (each must fail), then
+        restores HEAD with 'git reset --hard HEAD', even if something goes wrong.
+        Listed paths that aren't runnable test files (config 'test_files') are skipped.
 
-        With no files (a cycle of defensive tests only) it passes and skips. With no
-        production change since <base> it fails: nothing made the tests pass.
+        With no files (a cycle of defensive tests only) it passes and skips. It fails
+        if none of the listed files is runnable, or if there's no production change
+        since <base>: then nothing made the tests pass.
         """,
         cmd_prover,
     ),

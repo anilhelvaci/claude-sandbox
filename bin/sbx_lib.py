@@ -91,6 +91,22 @@ def git(*args: str, quiet: bool = False, check: bool = True) -> str:
 # several 'check' lines). conf_all returns every value, conf_get the first.
 
 
+_CONF_LINE = re.compile(r"^\s*([A-Za-z0-9_.\-]+)\s*=\s*(.*)$")
+
+
+def parse_conf(text: str) -> dict[str, list[str]]:
+    """Every key's values, in order, from "key = value" text (the config format,
+    also used by plugin manifests)."""
+    out: dict[str, list[str]] = {}
+    for line in split_lines(text):
+        if line.lstrip().startswith("#"):
+            continue
+        m = _CONF_LINE.match(line)
+        if m:
+            out.setdefault(m.group(1), []).append(m.group(2).rstrip())
+    return out
+
+
 def conf_all(key: str) -> list[str]:
     config = SBX_PROJECT / "config"
     if not config.is_file():
@@ -107,6 +123,41 @@ def conf_all(key: str) -> list[str]:
 def conf_get(key: str, default: str = "") -> str:
     values = conf_all(key)
     return (values[0] if values else "") or default
+
+
+# ---- gate plugins -------------------------------------------------------------
+# A plugin is a tool its author packages with an 'sbx-plugin.conf' manifest.
+# 'sbx plugins <name> add' installs it into the sandbox's plugin volume, mounted
+# read-only at SBX_PLUGINS, and records 'plugin = <name> <source>' in the config;
+# 'plugin.<name> = block | off' sets its mode (default block).
+
+SBX_PLUGINS = Path(os.environ.get("SBX_PLUGINS") or "/opt/sbx/plugins")
+PLUGIN_MANIFEST = "sbx-plugin.conf"
+
+
+def plugins_enabled() -> list[str]:
+    """Plugins listed in the config, in order, minus those set to 'off'."""
+    names = []
+    for value in conf_all("plugin"):
+        name = value.split()[0] if value.split() else ""
+        if name and name not in names and conf_get(f"plugin.{name}", "block") != "off":
+            names.append(name)
+    return names
+
+
+def plugin_state(name: str) -> Path:
+    """A plugin's writable directory ({state}): the install is read-only in the fleet,
+    so whatever a tool writes at run time (caches, downloaded compilers) goes here.
+    On the per-sandbox cache volume; 'sbx plugins' substitutes the same path at install."""
+    return Path.home() / ".cache" / "sbx-plugins" / name
+
+
+def plugin_manifest(name: str) -> dict[str, list[str]] | None:
+    """The installed plugin's manifest, or None if it isn't installed."""
+    try:
+        return parse_conf((SBX_PLUGINS / name / "src" / PLUGIN_MANIFEST).read_text())
+    except OSError:
+        return None
 
 
 # ---- task and bus location --------------------------------------------------
@@ -191,7 +242,23 @@ def matches_any(path: str, key: str) -> bool:
 
 
 def is_test_path(path: str) -> bool:
+    """A path the tester owns (config 'test_paths'): tests, fixtures, test helpers."""
     return matches_any(path, "test_paths")
+
+
+def is_runnable_test(path: str) -> bool:
+    """A test path that 'test_only' can run (config 'test_files').
+
+    Test paths also hold fixtures and helpers, possibly in another stack (a
+    Solidity fixture under a Python project's tests). Only the files matching
+    'test_files' are handed to 'test_only'; with no 'test_files' set, every test
+    path is.
+    """
+    if not is_test_path(path):
+        return False
+    if not any(v.strip() for v in conf_all("test_files")):
+        return True
+    return matches_any(path, "test_files")
 
 
 def is_protected(path: str) -> bool:
