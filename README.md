@@ -19,6 +19,7 @@ Everything is Python 3 (standard library only). Every command explains itself:
 - [How it fits together](#how-it-fits-together)
 - [Working with independent agents](#working-with-independent-agents)
 - [Teams: tester, builder, reviewer](#teams-tester-builder-reviewer)
+- [Seeing what the fleet built: atlas](#seeing-what-the-fleet-built-atlas)
 - [Bringing work back](#bringing-work-back)
 - [Firewall](#firewall)
 - [Command reference](#command-reference)
@@ -197,6 +198,38 @@ edit their roles, the gate or its config.
 Echidna and Medusa aren't in the image yet. Slither is (`--build-arg WITH_SLITHER=0` to
 leave it out, `--build-arg SLITHER_VERSION=x.y.z` to pin it).
 
+## Seeing what the fleet built: atlas
+
+Each time a cycle closes (the reviewer's pass, or the builder's handoff when there are no
+seats), the bus starts `atlas build` in the background. Nobody waits for it: the tester
+already holds the next turn. It draws the cycle twice, once against the cycle's base and
+once against the task's base (recorded by `bus init`):
+
+```sh
+sbx view proto vault          # one page per task; follows new cycles as they land
+```
+
+- **External API changes**: functions, events, errors, constructor, storage layout;
+  breaking ones (removed, mutability changed, storage moved) flagged. A breaking change
+  also lands in your inbox (`kind: api-break`).
+- **Module borders**: every contract grouped by directory, `lib/` and `node_modules/`
+  collapsed per package, edges that cross a directory drawn thick.
+- **Dependency graph diff**: the touched contracts and their neighbors; edges
+  (`is`, `uses`, `calls`, `new`) green when added, red dashed when removed.
+- **Impacted contracts**: a class diagram with each method marked NEW, CHANGED or REMOVED.
+- **Sequence diagrams**: tests new or changed this cycle, then every test matching the
+  config's `scenarios`, each traced through `forge test --json -vvvv` (calls between
+  contracts named by `vm.label`, emitted events, reverts with their error).
+
+Everything is extracted, not written by a model: Slither for structure, ABI and storage,
+forge traces for sequences. Each commit is exported with `git archive` into a temp dir
+inside the container (submodules and `node_modules` symlinked from the worktree), so the
+agents' worktree is never touched, and each commit's model is cached. Views and logs
+live in `<clone>/.git/sbx/<task>/views/`; `atlas list` (or `atlas build` by hand) works
+inside a task's worktree. `stack` picks the extractor: only `solidity` exists so far,
+and another stack is one script writing the same model (see `bin/atlas_solidity.py`).
+Turn it off with `atlas = off`.
+
 ## Bringing work back
 
 For a finished team task, `sbx merge <name> <task>` puts the work on the task's own branch
@@ -263,6 +296,7 @@ Every command has its own help: `sbx help <command>` or `sbx <command> --help`.
 | `sbx inbox <name>` | Your unread messages from every team |
 | `sbx proxy <name>` | Start the proxy (it acts only while the config says `proxy = on`) |
 | `sbx skills <name> [ls \| add <skill>... \| rm <skill>...]` | The stack skills this sandbox's agents see, copied from `$SBX_SKILLS_SRC` |
+| `sbx view <name> [task] [--no-open]` | Serve the task's atlas page on localhost (API changes, borders, dependency diff, sequences) |
 | `sbx merge <name> <task> [--branch B] [--yes] [--force]` | Put a finished task's work on its own branch in the repo you cloned from |
 | `sbx attach <name>` | Attach to the fleet's tmux session (detach: `Ctrl-b d`) |
 | `sbx shell <name>` | bash in the container as the agents' user |
@@ -290,6 +324,7 @@ Every command has its own help: `sbx help <command>` or `sbx <command> --help`.
 | `gate green` | Build, the full suite and every check pass |
 | `gate prover <base> <file>...` | With production changes reverted, the tests fail again |
 | `panel [base]` | Run the reviewer seats; verdict `pass` (exit 0), `changes` (3) or `error` (1) |
+| `atlas build [--head S] [--cycle-base S] [--task-base S] [--tests "files"]` / `atlas list` | Draw a cycle's view into `<bus>/views/` (the bus runs it when a cycle closes) |
 | `proxy loop [seconds]` / `proxy tick` | The proxy's watch loop, or one pass |
 | `role-prompt <role>` | Print a role's full system prompt |
 
@@ -348,7 +383,9 @@ claude-sandbox/
   init-firewall        the firewall script (Python; runs as root in the container)
   allowlist/           domains every sandbox may reach
   bin/                 mounted at /opt/sbx/bin (on the agents' PATH)
-    bus gate panel proxy role-prompt
+    bus gate panel proxy role-prompt atlas
+    atlas_render.py    atlas: model diff -> Mermaid (stack-agnostic)
+    atlas_solidity.py  atlas: Solidity extractor (runs under Slither's venv)
     sbx_lib.py         shared helpers: config, bus state, path classes
     sbx_cli.py         the subcommand/help dispatcher shared by sbx, bus, gate, proxy
   roles/               role briefs (COMMON, tester, builder, reviewer, proxy, jurors/)
@@ -362,6 +399,7 @@ $SBX_HOME/<name>/
     state/                        turn, bases, round, cycle tests, proxy counters
     log                           event log
     reviews/<time>/, reviews/latest   panel runs (seat outputs, findings.txt, verdict)
+    views/                        atlas: manifest.json, <n>-<sha>/view.json, cache/, atlas.log
     gate/                         gate logs
     proxy-decisions.md            every proxy decision
   project/             config, role notes, proxy.md, skills/
